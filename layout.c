@@ -11,6 +11,11 @@ layout_lba_for_vec(uint32_t vec_id, uint8_t stage)
 uint32_t
 layout_lba_count(struct stage_worker *w)
 {
-    uint32_t sector = spdk_nvme_ns_get_sector_size(w->ns);
-    return IO_BYTES / sector;
+    #ifdef FAKE_IO_TEST
+        (void)w;
+        return IO_BYTES / 512;
+    #else
+        uint32_t sector = spdk_nvme_ns_get_sector_size(w->ns);
+        return IO_BYTES / sector;
+    #endif
 }

@@ -1,6 +1,7 @@
 #include "topk.h"
 #include "query_ctx.h"
 #include <stdio.h>
+#include <stdlib.h>
 
 static void
 topk_insert(struct topk_state *st, uint32_t vec_id, float dist)
@@ -39,6 +40,9 @@ topk_accept_final_batch(void *arg)
     }
 
     free(batch);
+    // ---- 临时调试用 ----
+    printf("[topk] qid=%lu final batch count=%u\n", batch->qid, batch->count);
+    fflush(stdout);
 }
 
 void

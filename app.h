@@ -12,7 +12,9 @@
 #include <spdk/nvme.h>
 #include <spdk/util.h>
 
-#define NUM_STAGES 4
+#define NUM_STAGES 4  // 流水线段数目
+#define WORKERS_PER_DISK 4 // 每个盘绑多少个核
+#define TOTAL_WORKERS (NUM_STAGES * WORKERS_PER_DISK) // 盘一共用多少个核
 #define TOPK 10
 
 #define FULL_DIM 128
@@ -101,11 +103,28 @@ struct stage_worker {
     struct cand_batch *next_batch_accum;
 };
 
-struct app_ctx {
-    struct stage_worker stages[NUM_STAGES];
-    struct spdk_thread *topk_thread;
+struct disk_ctx {
+    const char *traddr;                  // 例如 "0000:68:00.0"
+    struct spdk_nvme_ctrlr *ctrlr;
+    struct spdk_nvme_ns *ns;
+    uint32_t sector_size;
 };
 
-extern struct app_ctx g_app;
+struct worker_ctx {
+    int worker_id;
+    int stage_id;                        // 0~3
+    int lane_id;                         // 0~3
+    int core_id;                         // 绑的核
+    struct disk_ctx *disk;               // 指向所属盘
+    struct spdk_nvme_qpair *qpair;       // 每个 worker 独占一个 qpair
+    pthread_t tid;
+};
+
+struct app_ctx {
+    struct disk_ctx disks[NUM_STAGES];
+    struct worker_ctx workers[TOTAL_WORKERS];
+};
+
+static struct app_ctx g_app;
 
 #endif
