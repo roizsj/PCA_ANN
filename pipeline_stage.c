@@ -7,7 +7,18 @@
 #include <string.h>
 #include <unistd.h>
 
-#define MAGIC_BATCH 0xBADC0DEu
+struct io_waiter {
+    volatile bool done;
+    int ok;
+};
+
+static void io_done_cb(void *arg, const struct spdk_nvme_cpl *cpl)
+{
+    struct io_waiter *wt = (struct io_waiter *)arg;
+    wt->ok = !spdk_nvme_cpl_is_error(cpl);
+    wt->done = true;
+}
+
 
 /* ============================================================
  * 1. 一个非常简单的指针队列
@@ -156,25 +167,36 @@ static void topk_insert(topk_state_t *st, uint32_t vec_id, float dist) {
  * 说明：
  *   - 每个 worker 拥有自己独占的 qpair
  *   - 读请求提交后，当前 worker 自己轮询自己的 qpair completion
+ *   - 现在是一个向量发起一次读盘请求，后面需要整合 TODO
  *
  * 这是最容易理解、最适合先把流水线跑起来的写法。
  * 后面你如果要做更高性能版本，可以再改成更异步的方式。
  * ============================================================ */
 
 static int read_vec_segment(stage_worker_t *w, uint32_t vec_id, void *buf) {
-    uint32_t lba_count = SLOT_BYTES / w->disk->sector_size;
-    uint64_t lba = (uint64_t)vec_id * lba_count;
-
-    struct io_waiter {
-        volatile bool done;
-        int ok;
-    } waiter = {.done = false, .ok = 0};
-
-    void io_done(void *arg, const struct spdk_nvme_cpl *cpl) {
-        struct io_waiter *wt = arg;
-        wt->ok = !spdk_nvme_cpl_is_error(cpl);
-        wt->done = true;
+    if (!w || !w->disk || !w->disk->ns || !w->qpair) {
+        fprintf(stderr, "[read_vec_segment] invalid worker context\n");
+        return -1;
     }
+
+    if (w->disk->sector_size == 0) {
+        fprintf(stderr, "[read_vec_segment] sector_size is 0 for disk %s\n", w->disk->traddr);
+        return -1;
+    }
+
+    if (SLOT_BYTES < w->disk->sector_size || (SLOT_BYTES % w->disk->sector_size) != 0) {
+        fprintf(stderr,
+                "[read_vec_segment] invalid SLOT_BYTES=%u for sector_size=%u disk=%s\n",
+                (unsigned)SLOT_BYTES,
+                w->disk->sector_size,
+                w->disk->traddr);
+        return -1;
+    }
+
+    uint32_t lba_count = SLOT_BYTES / w->disk->sector_size;
+    uint64_t lba = (uint64_t)vec_id * lba_count; // TODO 这里假设向量顺序存储，且id与lba直接对应，后面需要改成真正的索引结构
+
+    struct io_waiter waiter = {.done = false, .ok = 0};
 
     int rc = spdk_nvme_ns_cmd_read(
         w->disk->ns,
@@ -182,7 +204,7 @@ static int read_vec_segment(stage_worker_t *w, uint32_t vec_id, void *buf) {
         buf,
         lba,
         lba_count,
-        io_done,
+        io_done_cb,
         &waiter,
         0
     );
@@ -214,8 +236,15 @@ static void forward_batch(pipeline_app_t *app, batch_t *b) {
         free(b);
         return;
     }
+    
+    // 防一下非法stage的出现
+    if (b->stage >= NUM_STAGES) {
+        fprintf(stderr, "[forward_batch] invalid next stage=%u\n", b->stage);
+        free(b);
+        return;
+    }
 
-    int lane = pick_lane(b->items[0].vec_id);
+    int lane = pick_lane(b->items[0].vec_id); // 这里只用vec[0]的id做分流
     queue_push(&app->workers[b->stage][lane].inq, b);
 }
 
@@ -285,8 +314,9 @@ static void *stage_worker_main(void *arg) {
     w->qpair = spdk_nvme_ctrlr_alloc_io_qpair(w->disk->ctrlr, NULL, 0);
     if (!w->qpair) {
         fprintf(stderr,
-                "alloc_io_qpair failed worker=%d stage=%d lane=%d disk=%s\n",
-                w->worker_id, w->stage_id, w->lane_id, w->disk->traddr);
+        "alloc_io_qpair failed worker=%d stage=%d lane=%d disk=%s sector=%u\n",
+        w->worker_id, w->stage_id, w->lane_id,
+        w->disk->traddr, w->disk->sector_size);
         return NULL;
     }
 
@@ -316,6 +346,9 @@ static void *stage_worker_main(void *arg) {
         if (!in) {
             break;  /* 队列关闭 */
         }
+        printf("[stage %d lane %d] got batch qid=%lu count=%u first_vec=%u\n",
+            w->stage_id, w->lane_id, in->qid, in->count, in->items[0].vec_id);
+        fflush(stdout);
 
         if (in->magic != MAGIC_BATCH) {
             fprintf(stderr, "[stage %d] bad batch magic\n", w->stage_id);
@@ -512,6 +545,10 @@ void pipeline_submit_initial_batch(pipeline_app_t *app, batch_t *b) {
 
     int lane = pick_lane(b->items[0].vec_id);
     queue_push(&app->workers[0][lane].inq, b);
+    // 调试用输出
+    printf("[submit] qid=%lu stage=%u count=%u first_vec=%u\n",
+       b->qid, b->stage, b->count, b->items[0].vec_id);
+    fflush(stdout);
 }
 
 /* ============================================================
@@ -519,8 +556,6 @@ void pipeline_submit_initial_batch(pipeline_app_t *app, batch_t *b) {
  * ============================================================ */
 
 void pipeline_stop(pipeline_app_t *app) {
-    queue_close(&app->topk.inq);
-
     for (int s = 0; s < NUM_STAGES; s++) {
         for (int lane = 0; lane < WORKERS_PER_STAGE; lane++) {
             queue_close(&app->workers[s][lane].inq);
@@ -533,11 +568,16 @@ void pipeline_stop(pipeline_app_t *app) {
  * ============================================================ */
 
 void pipeline_join(pipeline_app_t *app) {
-    pthread_join(app->topk.tid, NULL);
-
+    /* 1. 先等所有 stage worker 退出 */
     for (int s = 0; s < NUM_STAGES; s++) {
         for (int lane = 0; lane < WORKERS_PER_STAGE; lane++) {
             pthread_join(app->workers[s][lane].tid, NULL);
         }
     }
+
+    /* 2. 现在不会再有新的 final batch 进入 topk 了，再关闭 topk 队列 */
+    queue_close(&app->topk.inq);
+
+    /* 3. 最后等 topk 线程退出 */
+    pthread_join(app->topk.tid, NULL);
 }

@@ -120,11 +120,4 @@ struct worker_ctx {
     pthread_t tid;
 };
 
-struct app_ctx {
-    struct disk_ctx disks[NUM_STAGES];
-    struct worker_ctx workers[TOTAL_WORKERS];
-};
-
-static struct app_ctx g_app;
-
 #endif
