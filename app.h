@@ -27,6 +27,9 @@
 /* 单个 batch 最多多少条候选 */
 #define BATCH_CAP 256
 
+/* 一个LBA（最小读盘粒度）包含多少个向量的segment*/
+#define SEGMENTS_PER_LBA (IO_BYTES / SEG_BYTES)
+
 struct stage_worker;
 struct query_ctx;
 struct cand_batch;

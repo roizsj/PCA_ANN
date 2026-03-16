@@ -1,4 +1,5 @@
 #include "pipeline_stage.h"
+#include "app.h"
 
 #include <errno.h>
 #include <sched.h>
@@ -26,6 +27,9 @@ static void io_done_cb(void *arg, const struct spdk_nvme_cpl *cpl)
  *   - 从ivf_meta.bin文件中读取聚类元数据，构建ivf_meta_t结构体，供后续索引使用
  * ============================================================ */
 int parse_ivf_meta(const char* filename, ivf_meta_t *meta) {
+    if (!meta) return -1;
+    memset(meta, 0, sizeof(*meta));
+
     FILE* fp = fopen(filename, "rb");
     if (!fp) {
         perror("fopen");
@@ -47,14 +51,14 @@ int parse_ivf_meta(const char* filename, ivf_meta_t *meta) {
         fread(&header.base_lba, sizeof(uint64_t), 1, fp) != 1) {
         fprintf(stderr, "Failed to read MetaHeader\n");
         fclose(fp);
-        return NULL;
+        return -1;
     }
 
     // 验证magic number
     if (magic != 0x49564633) {  // "IVF3"
         fprintf(stderr, "Invalid magic number: 0x%08X\n", magic);
         fclose(fp);
-        return NULL;
+        return -1;
     }
     
     meta->header = header;
@@ -70,30 +74,19 @@ int parse_ivf_meta(const char* filename, ivf_meta_t *meta) {
 
     // 读取每个ClusterMeta
         for (uint32_t i = 0; i < header.nlist; i++) {
-        uint32_t cluster_id, num_vecs, num_lbas;
-        uint64_t start_lba;
+        ClusterMetaOnDisk cm;
 
-        if (fread(&cluster_id, sizeof(uint32_t), 1, fp) != 1 ||
-            fread(&start_lba, sizeof(uint64_t), 1, fp) != 1 ||
-            fread(&num_vecs, sizeof(uint32_t), 1, fp) != 1 ||
-            fread(&num_lbas, sizeof(uint32_t), 1, fp) != 1) {
+        if (fread(&cm, sizeof(cm), 1, fp) != 1) {
             fprintf(stderr, "Failed to read cluster %u metadata\n", i);
             free_ivf_meta(meta);
             fclose(fp);
             return -1;
         }
 
-        if (fseek(fp, dim * sizeof(float), SEEK_CUR) != 0) {
-            fprintf(stderr, "Failed to skip centroid data for cluster %u\n", i);
-            free_ivf_meta(meta);
-            fclose(fp);
-            return -1;
-        }
-
-        meta->clusters[i].cluster_id = cluster_id;
-        meta->clusters[i].start_lba = start_lba;
-        meta->clusters[i].num_vectors = num_vecs;
-        meta->clusters[i].num_lbas = num_lbas;
+        meta->clusters[i].cluster_id = cm.cluster_id;
+        meta->clusters[i].start_lba = cm.start_lba;
+        meta->clusters[i].num_vectors = cm.num_vectors;
+        meta->clusters[i].num_lbas = cm.num_lbas;
     }
 
     fclose(fp);
@@ -209,15 +202,50 @@ float partial_l2(const float *x, const float *q) {
 }
 
 /*
- * 一个非常简单的 lane 选择策略：
- *   vec_id % WORKERS_PER_STAGE
- *
  * 作用：
- *   同一个 stage 有 4 个 worker，这里用 vec_id 做静态分流。
+ *   同一个 stage 有 4 个 worker，这里用 cluster_id和local_idx做一个简单的hash，决定发哪个worker。
  *   后面如果你想换成 batch hash / round-robin，都可以改这里。
  */
-static int pick_lane(uint32_t vec_id) {
-    return vec_id % WORKERS_PER_STAGE;
+static int pick_lane(uint32_t cluster_id, uint32_t local_idx) {
+    return (cluster_id ^ local_idx) % WORKERS_PER_STAGE;
+}
+
+/*
+ * 根据 cluster_id 在 ivf_meta 中找到对应的 cluster_info_t。后续如果能保证cluster_id = 数组下标则可以做优化 TODO
+ */
+const cluster_info_t *find_cluster_info(const ivf_meta_t *meta, uint32_t cluster_id) {
+    if (!meta || !meta->clusters) return NULL;
+
+    for (uint32_t i = 0; i < meta->nlist; i++) {
+        if (meta->clusters[i].cluster_id == cluster_id) {
+            return &meta->clusters[i];
+        }
+    }
+    return NULL;
+}
+
+
+static int cmp_cand_item_by_bundle(const void *a, const void *b) {
+    const cand_item_t *x = (const cand_item_t *)a;
+    const cand_item_t *y = (const cand_item_t *)b;
+
+    if (x->cluster_id < y->cluster_id) return -1;
+    if (x->cluster_id > y->cluster_id) return 1;
+
+    /* bundle_idx = local_idx / vectors_per_lba */
+    uint32_t x_bundle = x->local_idx / SEGMENTS_PER_LBA;
+    uint32_t y_bundle = y->local_idx / SEGMENTS_PER_LBA;
+
+    if (x_bundle < y_bundle) return -1;
+    if (x_bundle > y_bundle) return 1;
+
+    uint32_t x_lane = x->local_idx % SEGMENTS_PER_LBA;
+    uint32_t y_lane = y->local_idx % SEGMENTS_PER_LBA;
+
+    if (x_lane < y_lane) return -1;
+    if (x_lane > y_lane) return 1;
+
+    return 0;
 }
 
 /* ============================================================
@@ -263,28 +291,54 @@ static void topk_insert(topk_state_t *st, uint32_t vec_id, float dist) {
  * 后面你如果要做更高性能版本，可以再改成更异步的方式。
  * ============================================================ */
 
-static int read_vec_segment(stage_worker_t *w, uint32_t vec_id, void *buf) {
-    if (!w || !w->disk || !w->disk->ns || !w->qpair) {
+static int read_vec_segment(stage_worker_t *w,
+                            uint32_t cluster_id,
+                            uint32_t local_idx,
+                            void *buf)
+{
+    if (!w || !w->app || !w->disk || !w->disk->ns || !w->qpair) {
         fprintf(stderr, "[read_vec_segment] invalid worker context\n");
         return -1;
     }
 
-    if (w->disk->sector_size == 0) {
-        fprintf(stderr, "[read_vec_segment] sector_size is 0 for disk %s\n", w->disk->traddr);
+    pipeline_app_t *app = w->app;
+    ivf_meta_t *meta = &app->ivf_meta;
+
+    const cluster_info_t *ci = find_cluster_info(meta, cluster_id);
+    if (!ci) {
+        fprintf(stderr, "[read_vec_segment] cluster_id=%u not found\n", cluster_id);
         return -1;
     }
 
-    if (SLOT_BYTES < w->disk->sector_size || (SLOT_BYTES % w->disk->sector_size) != 0) {
+    if (local_idx >= ci->num_vectors) {
         fprintf(stderr,
-                "[read_vec_segment] invalid SLOT_BYTES=%u for sector_size=%u disk=%s\n",
-                (unsigned)SLOT_BYTES,
-                w->disk->sector_size,
-                w->disk->traddr);
+                "[read_vec_segment] local_idx=%u out of range for cluster=%u num_vectors=%u\n",
+                local_idx, cluster_id, ci->num_vectors);
         return -1;
     }
 
-    uint32_t lba_count = SLOT_BYTES / w->disk->sector_size;
-    uint64_t lba = (uint64_t)vec_id * lba_count; // TODO 这里假设向量顺序存储，且id与lba直接对应，后面需要改成真正的索引结构
+    uint32_t sector_size = w->disk->sector_size;
+    uint32_t shard_bytes = SEG_DIM * sizeof(float);   // 32 * 4 = 128
+    uint32_t vectors_per_lba = meta->header.vectors_per_lba;   // 应该是32
+
+    if (sector_size == 0 || vectors_per_lba == 0) {
+        fprintf(stderr, "[read_vec_segment] bad sector_size/vectors_per_lba\n");
+        return -1;
+    }
+
+    uint32_t bundle_idx = local_idx / vectors_per_lba;
+    uint32_t lane_idx   = local_idx % vectors_per_lba;
+    uint64_t lba        = ci->start_lba + bundle_idx;
+
+    uint64_t cluster_end_lba = ci->start_lba + ci->num_lbas;
+    if (lba >= cluster_end_lba) {
+        fprintf(stderr,
+                "[read_vec_segment] OOB read: cluster=%u local_idx=%u bundle_idx=%u "
+                "start_lba=%lu num_lbas=%u lba=%lu\n",
+                cluster_id, local_idx, bundle_idx,
+                ci->start_lba, ci->num_lbas, lba);
+        return -1;
+    }
 
     struct io_waiter waiter = {.done = false, .ok = 0};
 
@@ -293,13 +347,76 @@ static int read_vec_segment(stage_worker_t *w, uint32_t vec_id, void *buf) {
         w->qpair,
         buf,
         lba,
-        lba_count,
+        1,              // 只读1个LBA
         io_done_cb,
         &waiter,
         0
     );
 
     if (rc != 0) {
+        fprintf(stderr,
+                "[read_vec_segment] read submit failed rc=%d cluster=%u local_idx=%u lba=%lu\n",
+                rc, cluster_id, local_idx, lba);
+        return -1;
+    }
+
+    while (!waiter.done) {
+        spdk_nvme_qpair_process_completions(w->qpair, 0);
+    }
+
+    if (!waiter.ok) {
+        return -1;
+    }
+
+    return lane_idx;   // 返回lane，调用方自己取buf里的对应128B
+}
+
+// 按LBA分批读，跟上面分candidate读是两种思路，最后留一个就行了
+static int read_vec_bundle(stage_worker_t *w,
+                           uint32_t cluster_id,
+                           uint32_t bundle_idx,
+                           void *bundle_buf)
+{
+    if (!w || !w->app || !w->disk || !w->disk->ns || !w->qpair) {
+        fprintf(stderr, "[read_vec_bundle] invalid worker context\n");
+        return -1;
+    }
+
+    pipeline_app_t *app = w->app;
+    ivf_meta_t *meta = &app->ivf_meta;
+
+    const cluster_info_t *ci = find_cluster_info(meta, cluster_id);
+    if (!ci) {
+        fprintf(stderr, "[read_vec_bundle] cluster_id=%u not found\n", cluster_id);
+        return -1;
+    }
+
+    if (bundle_idx >= ci->num_lbas) {
+        fprintf(stderr,
+                "[read_vec_bundle] bundle_idx=%u out of range cluster=%u num_lbas=%u\n",
+                bundle_idx, cluster_id, ci->num_lbas);
+        return -1;
+    }
+
+    uint64_t lba = ci->start_lba + bundle_idx;
+
+    struct io_waiter waiter = {.done = false, .ok = 0};
+
+    int rc = spdk_nvme_ns_cmd_read(
+        w->disk->ns,
+        w->qpair,
+        bundle_buf,
+        lba,
+        1,              /* 一次只读一个4KB LBA */
+        io_done_cb,
+        &waiter,
+        0
+    );
+
+    if (rc != 0) {
+        fprintf(stderr,
+                "[read_vec_bundle] read submit failed rc=%d cluster=%u bundle=%u lba=%lu\n",
+                rc, cluster_id, bundle_idx, lba);
         return -1;
     }
 
@@ -309,7 +426,6 @@ static int read_vec_segment(stage_worker_t *w, uint32_t vec_id, void *buf) {
 
     return waiter.ok ? 0 : -1;
 }
-
 /* ============================================================
  * 5. 把一个 batch 转发给下一个 stage
  *
@@ -334,7 +450,7 @@ static void forward_batch(pipeline_app_t *app, batch_t *b) {
         return;
     }
 
-    int lane = pick_lane(b->items[0].vec_id); // 这里只用vec[0]的id做分流
+    int lane = pick_lane(b->items[0].cluster_id, b->items[0].local_idx); // 这里只用vec[0]的id做分流
     queue_push(&app->workers[b->stage][lane].inq, b);
 }
 
@@ -380,7 +496,7 @@ static void *topk_thread_main(void *arg) {
  *
  * 一个 stage worker 的职责：
  *   1. 从自己的输入队列取 batch
- *   2. 对 batch 里的每个 vec_id：
+ *   2. 对 batch 里的每个 vec_id(cluster_id, local_idx)：
  *        - 从本 stage 对应的盘读 segment
  *        - 计算 partial distance
  *        - 与 partial_sum 累加
@@ -420,7 +536,7 @@ static void *stage_worker_main(void *arg) {
      * 先用一个 buffer 反复读单个 segment
      */
     void *buf = spdk_zmalloc(
-        SLOT_BYTES,
+        w->disk->sector_size,
         4096,
         NULL,
         SPDK_ENV_NUMA_ID_ANY,
@@ -436,8 +552,9 @@ static void *stage_worker_main(void *arg) {
         if (!in) {
             break;  /* 队列关闭 */
         }
-        printf("[stage %d lane %d] got batch qid=%lu count=%u first_vec=%u\n",
-            w->stage_id, w->lane_id, in->qid, in->count, in->items[0].vec_id);
+        printf("[stage %d lane %d] got batch qid=%lu count=%u first_cluster=%u first_local=%u\n",
+            w->stage_id, w->lane_id, in->qid, in->count,
+            in->items[0].cluster_id, in->items[0].local_idx);
         fflush(stdout);
 
         if (in->magic != MAGIC_BATCH) {
@@ -463,19 +580,132 @@ static void *stage_worker_main(void *arg) {
 
         __sync_fetch_and_add(&app->stage_in[w->stage_id], in->count);
 
+        if (in->count > 1) {
+            qsort(in->items, in->count, sizeof(in->items[0]), cmp_cand_item_by_bundle);
+        }
+
+        // -------- 最简单的版本：逐candidate读 --------
+        // for (uint16_t i = 0; i < in->count; i++) {
+        //     uint32_t vec_id = in->items[i].vec_id; // 暂时保留 防止出错 确定数据布局了就可以删了 TODO
+        //     uint32_t cluster_id = in->items[i].cluster_id; 
+        //     uint32_t local_idx = in->items[i].local_idx; // 这两个是新加的索引元数据
+        //     float acc = in->items[i].partial_sum;
+
+        //     /* 1) 从当前 stage 对应的盘上读该向量的本段 segment */
+        //     int lane_idx = read_vec_segment(w, cluster_id, local_idx, buf);
+        //     if (lane_idx < 0) {
+        //         fprintf(stderr,
+        //                 "[stage %d] read failed cluster=%u local_idx=%u disk=%s\n",
+        //                 w->stage_id, cluster_id, local_idx, w->disk->traddr);
+        //         continue;
+        //     }
+
+        //     uint32_t shard_bytes = SEG_DIM * sizeof(float);
+        //     float *seg = (float *)((uint8_t *)buf + lane_idx * shard_bytes); // 读出来的segment只是buf的一小段
+        //     // TODO 这里需要整合盘上的读，不能每个segment都读一整个LB，放大太多了
+
+        //     /* 2) 计算 partial distance 并累加 */
+        //     float part = partial_l2(seg, app->query_segs[w->stage_id]);
+        //     acc += part;
+
+        //     /* 3) 提前终止：超过阈值则直接丢弃 */
+        //     if (acc > app->threshold) {
+        //         __sync_fetch_and_add(&app->stage_pruned[w->stage_id], 1);
+        //         continue;
+        //     }
+
+        //     /* 4) 如果这是最后一个 stage，送到 top-k */
+        //     if (w->stage_id == NUM_STAGES - 1) {
+        //         batch_t *finalb = calloc(1, sizeof(*finalb));
+        //         if (!finalb) {
+        //             perror("calloc final batch");
+        //             exit(1);
+        //         }
+
+        //         finalb->magic = MAGIC_BATCH;
+        //         finalb->qid = in->qid;
+        //         finalb->stage = NUM_STAGES;
+        //         finalb->count = 1;
+
+        //         finalb->items[0].vec_id = vec_id;  // 暂时保留防止出错 后面删掉 TODO
+        //         finalb->items[0].cluster_id = cluster_id;
+        //         finalb->items[0].local_idx = local_idx;
+        //         finalb->items[0].partial_sum = acc;
+
+        //         queue_push(&app->topk.inq, finalb);
+        //     } else {
+        //         /*
+        //          * 5) 否则放入 surviving batch，等待发给下一 stage
+        //          */
+        //         out->items[out->count].vec_id = vec_id;   // 暂时保留 后面删掉 TODO
+        //         out->items[out->count].cluster_id = cluster_id;
+        //         out->items[out->count].local_idx = local_idx;
+        //         out->items[out->count].partial_sum = acc;
+        //         out->count++;
+
+        //         /*
+        //          * 如果 out 满了，就先发一个批次出去，再开新的 out
+        //          */
+        //         if (out->count == MAX_BATCH) {
+        //             __sync_fetch_and_add(&app->stage_out[w->stage_id], out->count);
+        //             forward_batch(app, out);
+
+        //             out = calloc(1, sizeof(*out));
+        //             if (!out) {
+        //                 perror("calloc spill batch");
+        //                 exit(1);
+        //             }
+
+        //             out->magic = MAGIC_BATCH;
+        //             out->qid = in->qid;
+        //             out->stage = in->stage + 1;
+        //         }
+        //     }
+        // }
+
+
+        // -------- 优化版本：按LBA分批读 --------
+        // -------- 没加向量计算并行，后续再加 -------
+        const uint32_t vectors_per_lba = app->ivf_meta.header.vectors_per_lba;
+        const uint32_t shard_bytes = SEG_DIM * sizeof(float);
+
+        uint32_t cur_cluster_id = UINT32_MAX;
+        uint32_t cur_bundle_idx = UINT32_MAX;
+        bool bundle_loaded = false;
+        uint32_t bundles_read = 0; // 计数器，后面可删
+
         for (uint16_t i = 0; i < in->count; i++) {
             uint32_t vec_id = in->items[i].vec_id;
+            uint32_t cluster_id = in->items[i].cluster_id;
+            uint32_t local_idx = in->items[i].local_idx;
             float acc = in->items[i].partial_sum;
 
-            /* 1) 从当前 stage 对应的盘上读该向量的本段 segment */
-            if (read_vec_segment(w, vec_id, buf) != 0) {
-                fprintf(stderr, "[stage %d] read failed vec=%u disk=%s\n",
-                        w->stage_id, vec_id, w->disk->traddr);
-                continue;
+            uint32_t bundle_idx = local_idx / vectors_per_lba;
+            uint32_t lane_idx   = local_idx % vectors_per_lba;
+
+            /* 只有当 (cluster_id, bundle_idx) 变化时，才读一次新的LBA */
+            if (!bundle_loaded ||
+                cluster_id != cur_cluster_id ||
+                bundle_idx != cur_bundle_idx) {
+
+                if (read_vec_bundle(w, cluster_id, bundle_idx, buf) != 0) {
+                    fprintf(stderr,
+                            "[stage %d] bundle read failed cluster=%u bundle=%u disk=%s\n",
+                            w->stage_id, cluster_id, bundle_idx, w->disk->traddr);
+                    bundle_loaded = false;
+                    continue;
+                }
+
+                cur_cluster_id = cluster_id;
+                cur_bundle_idx = bundle_idx;
+                bundle_loaded = true;
+                bundles_read++; // 增加计数器
             }
 
+            float *seg = (float *)((uint8_t *)buf + lane_idx * shard_bytes);
+
             /* 2) 计算 partial distance 并累加 */
-            float part = partial_l2((float *)buf, app->query_segs[w->stage_id]);
+            float part = partial_l2(seg, app->query_segs[w->stage_id]);
             acc += part;
 
             /* 3) 提前终止：超过阈值则直接丢弃 */
@@ -497,20 +727,17 @@ static void *stage_worker_main(void *arg) {
                 finalb->stage = NUM_STAGES;
                 finalb->count = 1;
                 finalb->items[0].vec_id = vec_id;
+                finalb->items[0].cluster_id = cluster_id;
+                finalb->items[0].local_idx = local_idx;
                 finalb->items[0].partial_sum = acc;
-
                 queue_push(&app->topk.inq, finalb);
             } else {
-                /*
-                 * 5) 否则放入 surviving batch，等待发给下一 stage
-                 */
                 out->items[out->count].vec_id = vec_id;
+                out->items[out->count].cluster_id = cluster_id;
+                out->items[out->count].local_idx = local_idx;
                 out->items[out->count].partial_sum = acc;
                 out->count++;
 
-                /*
-                 * 如果 out 满了，就先发一个批次出去，再开新的 out
-                 */
                 if (out->count == MAX_BATCH) {
                     __sync_fetch_and_add(&app->stage_out[w->stage_id], out->count);
                     forward_batch(app, out);
@@ -536,6 +763,9 @@ static void *stage_worker_main(void *arg) {
             free(out);
         }
 
+        printf("[stage %d lane %d] processed batch qid=%lu count=%u bundles_read=%u\n",
+            w->stage_id, w->lane_id, in->qid, in->count, bundles_read);
+        fflush(stdout);
         free(in);
     }
 
@@ -641,11 +871,12 @@ void pipeline_submit_initial_batch(pipeline_app_t *app, batch_t *b) {
         abort();
     }
 
-    int lane = pick_lane(b->items[0].vec_id);
+    int lane = pick_lane(b->items[0].cluster_id, b->items[0].local_idx); // 这里只用vec[0]的id做分流
     queue_push(&app->workers[0][lane].inq, b);
     // 调试用输出
-    printf("[submit] qid=%lu stage=%u count=%u first_vec=%u\n",
-       b->qid, b->stage, b->count, b->items[0].vec_id);
+    printf("[submit] qid=%lu stage=%u count=%u first_cluster=%u first_local=%u\n",
+        b->qid, b->stage, b->count,
+        b->items[0].cluster_id, b->items[0].local_idx);
     fflush(stdout);
 }
 

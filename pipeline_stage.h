@@ -54,6 +54,16 @@
 /* -----------------------------
  * cluster metadata 数据结构
  * ----------------------------- */
+
+// 盘上存Cluster Metadata的结构体，和写盘文件里面用来存文件的结构体一致
+typedef struct {
+    uint32_t cluster_id;
+    uint64_t start_lba;
+    uint32_t num_vectors;
+    uint32_t num_lbas;
+    float centroid[128];
+} ClusterMetaOnDisk;
+
 // 声明结构体，用于存储IVF元数据头部信息
 typedef struct {
     uint32_t shard_dim;        // 分片维度
@@ -97,6 +107,21 @@ typedef struct {
     uint32_t local_idx;
     float partial_sum;
 } cand_item_t;
+
+/*
+ * 一个bundle：里面包含一系列向量，它们的segments位于同一个LBA上
+ *  - cluster_id: 这些candidate属于哪个cluster
+ *  - bundle_idx: 这些candidate对应的segment在cluster内的第几个bundle
+ *  - item_indices: 这些candidate在batch中的位置索引
+ *  - count: 这个bundle里有多少candidate
+*/
+typedef struct {
+    uint32_t cluster_id;
+    uint32_t bundle_idx;
+    uint16_t item_indices[MAX_BATCH];   // 指向 in->items[] 中哪些候选落在这个bundle
+    uint16_t count;
+} bundle_group_t;
+
 
 /*
  * 一个 batch：
@@ -289,6 +314,9 @@ int parse_ivf_meta(const char *filename, ivf_meta_t *meta);
 
 /* 释放ivf_meta_t 结构体及其内部内存 */
 void free_ivf_meta(ivf_meta_t* meta);
+
+/* 根据 cluster_id 在 ivf_meta 中找到对应的 cluster_info_t */
+const cluster_info_t *find_cluster_info(const ivf_meta_t *meta, uint32_t cluster_id);
 
 /* ============================================================
  * pipeline 模块接口
