@@ -52,16 +52,49 @@
 #define MAGIC_BATCH 0xBADC0DEu
 
 /* -----------------------------
+ * cluster metadata 数据结构
+ * ----------------------------- */
+// 声明结构体，用于存储IVF元数据头部信息
+typedef struct {
+    uint32_t shard_dim;        // 分片维度
+    uint32_t vectors_per_lba;  // 每个LBA的向量数
+    uint32_t nlist;            // 聚类数量
+    uint32_t num_vectors;      // 总向量数
+    uint32_t sector_size;      // 扇区大小
+    uint64_t base_lba;         // 基础LBA
+} ivf_meta_header_t;
+
+// 声明结构体，用于存储聚类信息
+typedef struct {
+    uint32_t cluster_id;    // 聚类ID
+    uint64_t start_lba;     // 起始LBA
+    uint32_t num_vectors;   // 向量数
+    uint32_t num_lbas;      // 占用的LBA数
+} cluster_info_t;
+
+// 声明结构体，用于存储完整的IVF元数据
+typedef struct {
+    ivf_meta_header_t header;  // 头部信息
+    cluster_info_t* clusters;  // 聚类信息数组
+    uint32_t nlist;            // 聚类数量（与header.nlist相同）
+} ivf_meta_t;
+
+
+/* -----------------------------
  * candidate / batch 数据结构
  * ----------------------------- */
 
 /*
  * 一个 candidate 的状态：
  *  - vec_id: 向量 ID
+ *  - cluster_id: 这个 candidate 属于哪个 cluster
+ *  - local_idx: 这个 candidate 在这个cluster内的哪个位置（offset = local_idx * SEG_DIM * 4）
  *  - partial_sum: 当前已经累计到的距离
  */
 typedef struct {
     uint32_t vec_id;
+    uint32_t cluster_id;    
+    uint32_t local_idx;
     float partial_sum;
 } cand_item_t;
 
@@ -221,6 +254,8 @@ typedef struct pipeline_app {
 
     /* top-k 状态 */
     topk_state_t topk_state;
+    /* 从 ivf_meta.bin 读到的 ivf metadata 信息 */
+    ivf_meta_t ivf_meta; 
 } pipeline_app_t;
 
 /* ============================================================
@@ -249,6 +284,12 @@ void bind_to_core(int core_id);
 /* 计算一个 segment 和 query 对应 segment 的 partial L2 距离 */
 float partial_l2(const float *x, const float *q);
 
+/* 解析ivf_metadata.bin */
+int parse_ivf_meta(const char *filename, ivf_meta_t *meta);
+
+/* 释放ivf_meta_t 结构体及其内部内存 */
+void free_ivf_meta(ivf_meta_t* meta);
+
 /* ============================================================
  * pipeline 模块接口
  * ============================================================ */
@@ -268,6 +309,7 @@ float partial_l2(const float *x, const float *q);
  *  - topk_core: top-k worker 绑定到哪个核
  *  - query_segs: query 的 4 个 segment
  *  - threshold: 提前终止阈值
+ *  - ivf_meta_path: ivf_meta.bin 的路径
  */
 int pipeline_init(
     pipeline_app_t *app,
@@ -275,7 +317,9 @@ int pipeline_init(
     const int stage_cores[NUM_STAGES][WORKERS_PER_STAGE],
     int topk_core,
     float *query_segs[NUM_STAGES],
-    float threshold);
+    float threshold,
+    const char *ivf_meta_path
+);
 
 /*
  * 启动所有 worker 线程：
@@ -305,5 +349,10 @@ void pipeline_stop(pipeline_app_t *app);
  * 一般与 pipeline_stop 配套使用。
  */
 void pipeline_join(pipeline_app_t *app);
+/*
+ * 清理资源
+ * 一般与 pipeline_stop, pipeline_join 配套使用。
+ */
+void pipeline_destroy(pipeline_app_t *app);
 
 #endif /* PIPELINE_STAGE_H */

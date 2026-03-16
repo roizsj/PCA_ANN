@@ -136,11 +136,12 @@ int main(int argc, char **argv)
         q3[i] = 0.0f;
     }
 
-    float threshold = 2000.0f; // 距离阈值
+    float threshold =120000.0f; // 距离阈值 TODO
+    const char *ivf_meta_path = "/home/zhangshujie/ann_ssd/pca_ann/preprocessing/ivf_output/ivf_meta.bin"; // ivf_meta的路径
 
     /* 5. 创建 pipeline，并把 probe 好的 disks 传进去 */
     pipeline_app_t app;
-    if (pipeline_init(&app, disks, stage_cores, topk_core, query_segs, threshold) != 0) {
+    if (pipeline_init(&app, disks, stage_cores, topk_core, query_segs, threshold, ivf_meta_path) != 0) {
         fprintf(stderr, "pipeline_init failed\n");
         return 1;
     }
@@ -163,8 +164,10 @@ int main(int argc, char **argv)
 
     sleep(5);
 
+    // 这里必须严格顺序，不然会内存泄漏
     pipeline_stop(&app);
     pipeline_join(&app);
+    pipeline_destroy(&app);
 
     for (int s = 0; s < NUM_STAGES; s++) {
         printf("stage%d in=%lu out=%lu pruned=%lu\n",

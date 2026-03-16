@@ -19,6 +19,96 @@ static void io_done_cb(void *arg, const struct spdk_nvme_cpl *cpl)
     wt->done = true;
 }
 
+/* ============================================================
+ * 0. 读ivf_meta.bin
+ *
+ * 作用：
+ *   - 从ivf_meta.bin文件中读取聚类元数据，构建ivf_meta_t结构体，供后续索引使用
+ * ============================================================ */
+int parse_ivf_meta(const char* filename, ivf_meta_t *meta) {
+    FILE* fp = fopen(filename, "rb");
+    if (!fp) {
+        perror("fopen");
+        return -1;
+    }
+
+    // 读取MetaHeader (40 bytes)
+    uint32_t magic, version, dim;
+    ivf_meta_header_t header;
+    
+    if (fread(&magic, sizeof(uint32_t), 1, fp) != 1 ||
+        fread(&version, sizeof(uint32_t), 1, fp) != 1 ||
+        fread(&dim, sizeof(uint32_t), 1, fp) != 1 ||
+        fread(&header.shard_dim, sizeof(uint32_t), 1, fp) != 1 ||
+        fread(&header.vectors_per_lba, sizeof(uint32_t), 1, fp) != 1 ||
+        fread(&header.nlist, sizeof(uint32_t), 1, fp) != 1 ||
+        fread(&header.num_vectors, sizeof(uint32_t), 1, fp) != 1 ||
+        fread(&header.sector_size, sizeof(uint32_t), 1, fp) != 1 ||
+        fread(&header.base_lba, sizeof(uint64_t), 1, fp) != 1) {
+        fprintf(stderr, "Failed to read MetaHeader\n");
+        fclose(fp);
+        return NULL;
+    }
+
+    // 验证magic number
+    if (magic != 0x49564633) {  // "IVF3"
+        fprintf(stderr, "Invalid magic number: 0x%08X\n", magic);
+        fclose(fp);
+        return NULL;
+    }
+    
+    meta->header = header;
+    meta->nlist = header.nlist;
+
+    // 分配cluster_info_t数组
+    meta->clusters = malloc(header.nlist * sizeof(cluster_info_t));
+    if (!meta->clusters) {
+        perror("malloc clusters");
+        fclose(fp);
+        return -1;
+    }
+
+    // 读取每个ClusterMeta
+        for (uint32_t i = 0; i < header.nlist; i++) {
+        uint32_t cluster_id, num_vecs, num_lbas;
+        uint64_t start_lba;
+
+        if (fread(&cluster_id, sizeof(uint32_t), 1, fp) != 1 ||
+            fread(&start_lba, sizeof(uint64_t), 1, fp) != 1 ||
+            fread(&num_vecs, sizeof(uint32_t), 1, fp) != 1 ||
+            fread(&num_lbas, sizeof(uint32_t), 1, fp) != 1) {
+            fprintf(stderr, "Failed to read cluster %u metadata\n", i);
+            free_ivf_meta(meta);
+            fclose(fp);
+            return -1;
+        }
+
+        if (fseek(fp, dim * sizeof(float), SEEK_CUR) != 0) {
+            fprintf(stderr, "Failed to skip centroid data for cluster %u\n", i);
+            free_ivf_meta(meta);
+            fclose(fp);
+            return -1;
+        }
+
+        meta->clusters[i].cluster_id = cluster_id;
+        meta->clusters[i].start_lba = start_lba;
+        meta->clusters[i].num_vectors = num_vecs;
+        meta->clusters[i].num_lbas = num_lbas;
+    }
+
+    fclose(fp);
+    return 0;
+}
+
+// 释放ivf_meta_t结构体及其内部内存
+void free_ivf_meta(ivf_meta_t *meta) {
+    if (!meta) return;
+    free(meta->clusters);
+    meta->clusters = NULL;
+    meta->nlist = 0;
+    memset(&meta->header, 0, sizeof(meta->header));
+}
+
 
 /* ============================================================
  * 1. 一个非常简单的指针队列
@@ -474,7 +564,9 @@ int pipeline_init(
     const int stage_cores[NUM_STAGES][WORKERS_PER_STAGE],
     int topk_core,
     float *query_segs[NUM_STAGES],
-    float threshold)
+    float threshold,
+    const char *ivf_meta_path
+)
 {
     memset(app, 0, sizeof(*app));
 
@@ -491,6 +583,12 @@ int pipeline_init(
     }
 
     app->threshold = threshold;
+
+    /* 读入ivf_meta信息 */
+    if (parse_ivf_meta(ivf_meta_path, &app->ivf_meta) != 0) {
+        fprintf(stderr, "pipeline_init: failed to load ivf meta from %s\n", ivf_meta_path);
+        return -1;
+    }
 
     pthread_mutex_init(&app->topk_state.mu, NULL);
 
@@ -580,4 +678,27 @@ void pipeline_join(pipeline_app_t *app) {
 
     /* 3. 最后等 topk 线程退出 */
     pthread_join(app->topk.tid, NULL);
+}
+
+/* ============================================================
+ * 13. 清理内存空间
+ * ============================================================ */
+void pipeline_destroy(pipeline_app_t *app) {
+    if (!app) return;
+
+    free_ivf_meta(&app->ivf_meta);
+
+    pthread_mutex_destroy(&app->topk_state.mu);
+
+    for (int s = 0; s < NUM_STAGES; s++) {
+        for (int lane = 0; lane < WORKERS_PER_STAGE; lane++) {
+            pthread_mutex_destroy(&app->workers[s][lane].inq.mu);
+            pthread_cond_destroy(&app->workers[s][lane].inq.cv);
+        }
+    }
+
+    pthread_mutex_destroy(&app->topk.inq.mu);
+    pthread_cond_destroy(&app->topk.inq.cv);
+
+    memset(&app->topk_state, 0, sizeof(app->topk_state));
 }
