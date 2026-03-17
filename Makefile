@@ -3,11 +3,8 @@ APP_NAME := pca_ann
 
 SRC := \
 	main.c \
-	layout.c \
-	distance.c \
-	query_ctx.c \
-	topk.c \
 	pipeline_stage.c \
+	query_loader.c
 
 PKG_CONFIG_PATH := $(SPDK_DIR)/build/lib/pkgconfig
 export PKG_CONFIG_PATH=/home/wq/spdk/build/lib/pkgconfig:$PKG_CONFIG_PATH

@@ -98,7 +98,7 @@ typedef struct {
 
 /*
  * 一个 candidate 的状态：
- *  - vec_id: 向量 ID
+ *  - vec_id: 向量 ID TODO 改成sorted_id
  *  - cluster_id: 这个 candidate 属于哪个 cluster
  *  - local_idx: 这个 candidate 在这个cluster内的哪个位置（offset = local_idx * SEG_DIM * 4）
  *  - partial_sum: 当前已经累计到的距离
@@ -278,9 +278,14 @@ typedef struct {
     /* 是否完成 */
     bool done;
 
-    /* 时间统计 */
-    uint64_t t_submit_ns;
-    uint64_t t_done_ns;
+    /* profile */
+    uint64_t stage_in[NUM_STAGES];
+    uint64_t stage_out[NUM_STAGES];
+    uint64_t stage_pruned[NUM_STAGES];
+    uint64_t stage_bundles_read[NUM_STAGES];
+    double submit_ts_us;
+    double done_ts_us;
+
 } query_tracker_t;
 
 /* -----------------------------

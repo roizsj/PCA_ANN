@@ -7,11 +7,19 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <time.h>
 
 struct io_waiter {
     volatile bool done;
     int ok;
 };
+
+static inline double now_us(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec * 1e6 + (double)ts.tv_nsec / 1e3;
+}
 
 static void io_done_cb(void *arg, const struct spdk_nvme_cpl *cpl)
 {
@@ -154,6 +162,17 @@ void free_ivf_meta(ivf_meta_t *meta) {
     meta->clusters = NULL;
     meta->nlist = 0;
     memset(&meta->header, 0, sizeof(meta->header));
+}
+
+// 通过qid查找query_tracker_t的辅助函数，要求调用时已经持有app->query_mu锁
+static query_tracker_t *find_query_tracker_locked(pipeline_app_t *app, uint64_t qid)
+{
+    for (uint32_t i = 0; i < MAX_QUERIES_IN_FLIGHT; i++) {
+        if (app->queries[i].qid == qid) {
+            return &app->queries[i];
+        }
+    }
+    return NULL;
 }
 
 
@@ -635,6 +654,12 @@ static void *stage_worker_main(void *arg) {
 
         __sync_fetch_and_add(&app->stage_in[w->stage_id], in->count);
 
+        /* batch内profile */
+        uint32_t batch_in = in->count;
+        uint32_t batch_pruned = 0;
+        uint32_t batch_out = 0;              /* 统一定义为本 stage 保留下来的数量 */
+        uint32_t batch_bundles_read = 0;
+
         if (in->count > 1) {
             qsort(in->items, in->count, sizeof(in->items[0]), cmp_cand_item_by_bundle);
         }
@@ -674,7 +699,7 @@ static void *stage_worker_main(void *arg) {
                 cur_cluster_id = cluster_id;
                 cur_bundle_idx = bundle_idx;
                 bundle_loaded = true;
-                bundles_read++; // 增加计数器
+                batch_bundles_read++; // 增加计数器
             }
 
             float *seg = (float *)((uint8_t *)buf + lane_idx * shard_bytes);
@@ -686,8 +711,10 @@ static void *stage_worker_main(void *arg) {
             /* 3) 提前终止：超过阈值则直接丢弃 */
             if (acc > app->threshold) {
                 __sync_fetch_and_add(&app->stage_pruned[w->stage_id], 1);
+                batch_pruned++;
                 continue;
             }
+            batch_out++;
 
             /* 4) 如果这是最后一个 stage，送到 top-k */
             if (w->stage_id == NUM_STAGES - 1) {
@@ -731,21 +758,42 @@ static void *stage_worker_main(void *arg) {
         }
 
         /* 扫完输入 batch 后，把剩余 surviving batch 发出去 */
+        bool batch_done_here = false;
+
         if (w->stage_id != NUM_STAGES - 1) {
-            __sync_fetch_and_add(&app->stage_out[w->stage_id], out->count);
-            forward_batch(app, out);
+            __sync_fetch_and_add(&app->stage_out[w->stage_id], batch_out);
+
+            if (out->count > 0) {
+                forward_batch(app, out);
+            } else {
+                free(out);
+                batch_done_here = true;   /* 中途被完全剪空 */
+            }
         } else {
+            __sync_fetch_and_add(&app->stage_out[w->stage_id], batch_out);
             free(out);
+            batch_done_here = true;       /* 最后一层处理完 */
         }
 
-        /* 如果是最后一个stage，终止 */
-        if (w->stage_id == NUM_STAGES - 1) {
+        /* 先更新 per-query profiling */
+        pthread_mutex_lock(&app->query_mu);
+        query_tracker_t *qt = find_query_tracker_locked(app, in->qid);
+        if (qt) {
+            qt->stage_in[w->stage_id] += batch_in;
+            qt->stage_out[w->stage_id] += batch_out;
+            qt->stage_pruned[w->stage_id] += batch_pruned;
+            qt->stage_bundles_read[w->stage_id] += batch_bundles_read;
+        }
+        pthread_mutex_unlock(&app->query_mu);
+
+        /* 再结束这个 batch 的生命周期 */
+        if (batch_done_here) {
             mark_batch_finished(app, in->qid);
         }
 
-
-        printf("[stage %d lane %d] processed batch qid=%lu count=%u bundles_read=%u\n",
-            w->stage_id, w->lane_id, in->qid, in->count, bundles_read);
+        printf("[stage %d lane %d] processed batch qid=%lu in=%u out=%u pruned=%u bundles_read=%u\n",
+            w->stage_id, w->lane_id, in->qid,
+            batch_in, batch_out, batch_pruned, batch_bundles_read);
         fflush(stdout);
         free(in);
     }
@@ -958,9 +1006,17 @@ query_tracker_t *register_query(pipeline_app_t *app,
             qt->qid = qid;
             qt->nprobe = nprobe;
             qt->num_probed_clusters = num_probed_clusters;
+            qt->initial_candidates = 0;
+            qt->submitted_batches = 0;
+            qt->finished_batches = 0;
             qt->done = false;
-            qt->t_submit_ns = 0;   /* 第一版先不填真实时间 */
-            qt->t_done_ns = 0;
+            memset(qt->stage_in, 0, sizeof(qt->stage_in));
+            memset(qt->stage_out, 0, sizeof(qt->stage_out));
+            memset(qt->stage_pruned, 0, sizeof(qt->stage_pruned));
+            memset(qt->stage_bundles_read, 0, sizeof(qt->stage_bundles_read));
+
+            qt->submit_ts_us = now_us();
+            qt->done_ts_us = 0.0;
 
             pthread_mutex_unlock(&app->query_mu);
             return qt;
@@ -988,7 +1044,7 @@ void mark_batch_finished(pipeline_app_t *app, uint64_t qid)
 
             if (qt->finished_batches == qt->submitted_batches) {
                 qt->done = true;
-                qt->t_done_ns = 0;   /* 第一版先不填真实时间 */
+                qt->done_ts_us = now_us();
             }
 
             pthread_mutex_unlock(&app->query_mu);
@@ -1117,7 +1173,7 @@ int submit_cluster_candidates(pipeline_app_t *app,
         b->stage = 0;
 
         while (local_idx < num_vec && b->count < max_batch) {
-            b->items[b->count].vec_id = local_idx; /* 第一版先占位 */
+            b->items[b->count].vec_id = local_idx; /* TODO 这里先用了local_idx，后面要改成正确的sorted_idx */
             b->items[b->count].cluster_id = cluster_id;
             b->items[b->count].local_idx = local_idx;
             b->items[b->count].partial_sum = 0.0f;
@@ -1150,6 +1206,8 @@ int submit_cluster_candidates(pipeline_app_t *app,
     return -1;
 }
 
+
+// 这是外部接口，main.c会调用它来提交一个query
 int submit_query(pipeline_app_t *app,
                  uint64_t qid,
                  const float *query,
