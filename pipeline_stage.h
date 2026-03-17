@@ -51,6 +51,8 @@
  */
 #define MAGIC_BATCH 0xBADC0DEu
 
+#define MAX_QUERIES_IN_FLIGHT 1024
+
 /* -----------------------------
  * cluster metadata 数据结构
  * ----------------------------- */
@@ -244,6 +246,43 @@ typedef struct {
     int core_id;
 } topk_worker_t;
 
+// 聚类命中项；用于IVF取nprobe个聚类
+typedef struct {
+    uint32_t cluster_id;
+    float dist;
+} coarse_hit_t;
+
+// query对象
+typedef struct {
+    uint64_t qid;
+    float full_query[FULL_DIM];              // 128维完整query
+    float *query_segs[NUM_STAGES];      // 指向4个32维segment
+    uint32_t nprobe;
+} query_ctx_t;
+
+// query状态跟踪
+typedef struct {
+    uint64_t qid;
+
+    /* query级输入信息 */
+    uint32_t nprobe;
+    uint32_t num_probed_clusters;
+
+    /* initial batch 提交统计 */
+    uint64_t initial_candidates;
+    uint32_t submitted_batches;
+
+    /* 完成检测 */
+    uint32_t finished_batches;
+
+    /* 是否完成 */
+    bool done;
+
+    /* 时间统计 */
+    uint64_t t_submit_ns;
+    uint64_t t_done_ns;
+} query_tracker_t;
+
 /* -----------------------------
  * pipeline 总上下文
  * ----------------------------- */
@@ -267,7 +306,7 @@ typedef struct pipeline_app {
     topk_worker_t topk;
 
     /* query 被切成 4 段后的 segment 指针 */
-    float *query_segs[NUM_STAGES];
+    float *query_segs[NUM_STAGES]; // TODO 这个可能会有很多query
 
     /* 提前终止阈值 */
     float threshold;
@@ -281,6 +320,16 @@ typedef struct pipeline_app {
     topk_state_t topk_state;
     /* 从 ivf_meta.bin 读到的 ivf metadata 信息 */
     ivf_meta_t ivf_meta; 
+
+
+    /* 新增：coarse centroids */
+    uint32_t nlist;
+    float *centroids;   // nlist * DIM
+
+    /* query 跟踪表 */
+    query_tracker_t queries[MAX_QUERIES_IN_FLIGHT];
+    pthread_mutex_t query_mu;
+
 } pipeline_app_t;
 
 /* ============================================================
@@ -382,5 +431,39 @@ void pipeline_join(pipeline_app_t *app);
  * 一般与 pipeline_stop, pipeline_join 配套使用。
  */
 void pipeline_destroy(pipeline_app_t *app);
+
+
+/* ============================================================
+ * query 相关接口 3.17更新
+ * ============================================================ */
+
+ 
+ 
+int load_centroids_bin(const char *path, uint32_t *nlist_out, float **centroids_out);
+
+int coarse_search_topn(const float *query,
+                       const float *centroids,
+                       uint32_t nlist,
+                       uint32_t nprobe,
+                       coarse_hit_t *out_hits);
+
+query_tracker_t *register_query(pipeline_app_t *app,
+                                uint64_t qid,
+                                uint32_t nprobe,
+                                uint32_t num_probed_clusters);
+
+void mark_batch_finished(pipeline_app_t *app, uint64_t qid);
+
+int wait_query_done(pipeline_app_t *app, uint64_t qid, uint32_t timeout_ms);
+
+int submit_cluster_candidates(pipeline_app_t *app,
+                              uint64_t qid,
+                              uint32_t cluster_id,
+                              uint32_t max_batch);
+
+int submit_query(pipeline_app_t *app,
+                 uint64_t qid,
+                 const float *query,
+                 uint32_t nprobe);
 
 #endif /* PIPELINE_STAGE_H */

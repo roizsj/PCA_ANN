@@ -93,6 +93,60 @@ int parse_ivf_meta(const char* filename, ivf_meta_t *meta) {
     return 0;
 }
 
+// 读 centroids.bin 文件
+int load_centroids_bin(const char *path, uint32_t *nlist_out, float **centroids_out)
+{
+    if (!path || !nlist_out || !centroids_out) {
+        return -1;
+    }
+
+    *nlist_out = 0;
+    *centroids_out = NULL;
+
+    FILE *fp = fopen(path, "rb");
+    if (!fp) {
+        perror("fopen centroids");
+        return -1;
+    }
+
+    uint32_t nlist = 0, dim = 0;
+    if (fread(&nlist, sizeof(uint32_t), 1, fp) != 1 ||
+        fread(&dim, sizeof(uint32_t), 1, fp) != 1) {
+        fprintf(stderr, "load_centroids_bin: failed to read header\n");
+        fclose(fp);
+        return -1;
+    }
+
+    if (dim != FULL_DIM) {
+        fprintf(stderr,
+                "load_centroids_bin: dim mismatch got=%u expected=%d\n",
+                dim, FULL_DIM);
+        fclose(fp);
+        return -1;
+    }
+
+    float *centroids = (float *)malloc((size_t)nlist * FULL_DIM * sizeof(float));
+    if (!centroids) {
+        perror("malloc centroids");
+        fclose(fp);
+        return -1;
+    }
+
+    size_t want = (size_t)nlist * FULL_DIM;
+    if (fread(centroids, sizeof(float), want, fp) != want) {
+        fprintf(stderr, "load_centroids_bin: failed to read centroids body\n");
+        free(centroids);
+        fclose(fp);
+        return -1;
+    }
+
+    fclose(fp);
+
+    *nlist_out = nlist;
+    *centroids_out = centroids;
+    return 0;
+}
+
 // 释放ivf_meta_t结构体及其内部内存
 void free_ivf_meta(ivf_meta_t *meta) {
     if (!meta) return;
@@ -101,6 +155,7 @@ void free_ivf_meta(ivf_meta_t *meta) {
     meta->nlist = 0;
     memset(&meta->header, 0, sizeof(meta->header));
 }
+
 
 
 /* ============================================================
@@ -584,86 +639,6 @@ static void *stage_worker_main(void *arg) {
             qsort(in->items, in->count, sizeof(in->items[0]), cmp_cand_item_by_bundle);
         }
 
-        // -------- 最简单的版本：逐candidate读 --------
-        // for (uint16_t i = 0; i < in->count; i++) {
-        //     uint32_t vec_id = in->items[i].vec_id; // 暂时保留 防止出错 确定数据布局了就可以删了 TODO
-        //     uint32_t cluster_id = in->items[i].cluster_id; 
-        //     uint32_t local_idx = in->items[i].local_idx; // 这两个是新加的索引元数据
-        //     float acc = in->items[i].partial_sum;
-
-        //     /* 1) 从当前 stage 对应的盘上读该向量的本段 segment */
-        //     int lane_idx = read_vec_segment(w, cluster_id, local_idx, buf);
-        //     if (lane_idx < 0) {
-        //         fprintf(stderr,
-        //                 "[stage %d] read failed cluster=%u local_idx=%u disk=%s\n",
-        //                 w->stage_id, cluster_id, local_idx, w->disk->traddr);
-        //         continue;
-        //     }
-
-        //     uint32_t shard_bytes = SEG_DIM * sizeof(float);
-        //     float *seg = (float *)((uint8_t *)buf + lane_idx * shard_bytes); // 读出来的segment只是buf的一小段
-        //     // TODO 这里需要整合盘上的读，不能每个segment都读一整个LB，放大太多了
-
-        //     /* 2) 计算 partial distance 并累加 */
-        //     float part = partial_l2(seg, app->query_segs[w->stage_id]);
-        //     acc += part;
-
-        //     /* 3) 提前终止：超过阈值则直接丢弃 */
-        //     if (acc > app->threshold) {
-        //         __sync_fetch_and_add(&app->stage_pruned[w->stage_id], 1);
-        //         continue;
-        //     }
-
-        //     /* 4) 如果这是最后一个 stage，送到 top-k */
-        //     if (w->stage_id == NUM_STAGES - 1) {
-        //         batch_t *finalb = calloc(1, sizeof(*finalb));
-        //         if (!finalb) {
-        //             perror("calloc final batch");
-        //             exit(1);
-        //         }
-
-        //         finalb->magic = MAGIC_BATCH;
-        //         finalb->qid = in->qid;
-        //         finalb->stage = NUM_STAGES;
-        //         finalb->count = 1;
-
-        //         finalb->items[0].vec_id = vec_id;  // 暂时保留防止出错 后面删掉 TODO
-        //         finalb->items[0].cluster_id = cluster_id;
-        //         finalb->items[0].local_idx = local_idx;
-        //         finalb->items[0].partial_sum = acc;
-
-        //         queue_push(&app->topk.inq, finalb);
-        //     } else {
-        //         /*
-        //          * 5) 否则放入 surviving batch，等待发给下一 stage
-        //          */
-        //         out->items[out->count].vec_id = vec_id;   // 暂时保留 后面删掉 TODO
-        //         out->items[out->count].cluster_id = cluster_id;
-        //         out->items[out->count].local_idx = local_idx;
-        //         out->items[out->count].partial_sum = acc;
-        //         out->count++;
-
-        //         /*
-        //          * 如果 out 满了，就先发一个批次出去，再开新的 out
-        //          */
-        //         if (out->count == MAX_BATCH) {
-        //             __sync_fetch_and_add(&app->stage_out[w->stage_id], out->count);
-        //             forward_batch(app, out);
-
-        //             out = calloc(1, sizeof(*out));
-        //             if (!out) {
-        //                 perror("calloc spill batch");
-        //                 exit(1);
-        //             }
-
-        //             out->magic = MAGIC_BATCH;
-        //             out->qid = in->qid;
-        //             out->stage = in->stage + 1;
-        //         }
-        //     }
-        // }
-
-
         // -------- 优化版本：按LBA分批读 --------
         // -------- 没加向量计算并行，后续再加 -------
         const uint32_t vectors_per_lba = app->ivf_meta.header.vectors_per_lba;
@@ -763,6 +738,12 @@ static void *stage_worker_main(void *arg) {
             free(out);
         }
 
+        /* 如果是最后一个stage，终止 */
+        if (w->stage_id == NUM_STAGES - 1) {
+            mark_batch_finished(app, in->qid);
+        }
+
+
         printf("[stage %d lane %d] processed batch qid=%lu count=%u bundles_read=%u\n",
             w->stage_id, w->lane_id, in->qid, in->count, bundles_read);
         fflush(stdout);
@@ -820,7 +801,12 @@ int pipeline_init(
         return -1;
     }
 
+    /* 初始化topk队列锁 */
     pthread_mutex_init(&app->topk_state.mu, NULL);
+
+    /* 初始化query相关数据结构 */
+    pthread_mutex_init(&app->query_mu, NULL);
+    memset(app->queries, 0, sizeof(app->queries));
 
     /* 初始化 topk worker */
     queue_init(&app->topk.inq);
@@ -930,6 +916,333 @@ void pipeline_destroy(pipeline_app_t *app) {
 
     pthread_mutex_destroy(&app->topk.inq.mu);
     pthread_cond_destroy(&app->topk.inq.cv);
+    // 回收query有关数据结构的空间
+    free(app->centroids);
+    app->centroids = NULL;
+    app->nlist = 0;
+    pthread_mutex_destroy(&app->query_mu);
 
     memset(&app->topk_state, 0, sizeof(app->topk_state));
 }
+
+/* ============================================================
+ * 14.query helper
+ * ============================================================ */
+// 注册一个新的 query，返回对应的 tracker 结构体指针
+query_tracker_t *register_query(pipeline_app_t *app,
+                                uint64_t qid,
+                                uint32_t nprobe,
+                                uint32_t num_probed_clusters)
+{
+    if (!app || qid == 0) {
+        return NULL;
+    }
+
+    pthread_mutex_lock(&app->query_mu);
+
+    /* 先防重复 qid */
+    for (uint32_t i = 0; i < MAX_QUERIES_IN_FLIGHT; i++) {
+        if (app->queries[i].qid == qid) {
+            pthread_mutex_unlock(&app->query_mu);
+            fprintf(stderr, "register_query: duplicate qid=%lu\n", qid);
+            return NULL;
+        }
+    }
+
+    /* 找空槽 */
+    for (uint32_t i = 0; i < MAX_QUERIES_IN_FLIGHT; i++) {
+        if (app->queries[i].qid == 0) {
+            query_tracker_t *qt = &app->queries[i];
+            memset(qt, 0, sizeof(*qt));
+
+            qt->qid = qid;
+            qt->nprobe = nprobe;
+            qt->num_probed_clusters = num_probed_clusters;
+            qt->done = false;
+            qt->t_submit_ns = 0;   /* 第一版先不填真实时间 */
+            qt->t_done_ns = 0;
+
+            pthread_mutex_unlock(&app->query_mu);
+            return qt;
+        }
+    }
+
+    pthread_mutex_unlock(&app->query_mu);
+    fprintf(stderr, "register_query: no free query slot\n");
+    return NULL;
+}
+
+// 这个函数要在最后一个 stage 把一个输入 batch 全部处理完之后调用一次
+void mark_batch_finished(pipeline_app_t *app, uint64_t qid)
+{
+    if (!app || qid == 0) {
+        return;
+    }
+
+    pthread_mutex_lock(&app->query_mu);
+
+    for (uint32_t i = 0; i < MAX_QUERIES_IN_FLIGHT; i++) {
+        query_tracker_t *qt = &app->queries[i];
+        if (qt->qid == qid) {
+            qt->finished_batches++;
+
+            if (qt->finished_batches == qt->submitted_batches) {
+                qt->done = true;
+                qt->t_done_ns = 0;   /* 第一版先不填真实时间 */
+            }
+
+            pthread_mutex_unlock(&app->query_mu);
+            return;
+        }
+    }
+
+    pthread_mutex_unlock(&app->query_mu);
+    fprintf(stderr, "mark_batch_finished: qid=%lu not found\n", qid);
+}
+
+
+// 暴力搜top nprobe个聚类
+int coarse_search_topn(const float *query,
+                       const float *centroids,
+                       uint32_t nlist,
+                       uint32_t nprobe,
+                       coarse_hit_t *out_hits)
+{
+    if (!query || !centroids || !out_hits || nprobe == 0 || nprobe > nlist) {
+        return -1;
+    }
+
+    /* 初始化 top-nprobe 为 +inf */
+    for (uint32_t i = 0; i < nprobe; i++) {
+        out_hits[i].cluster_id = UINT32_MAX;
+        out_hits[i].dist = __FLT_MAX__;
+    }
+
+    for (uint32_t cid = 0; cid < nlist; cid++) {
+        const float *c = centroids + (size_t)cid * FULL_DIM;
+
+        float dist = 0.0f;
+        for (uint32_t d = 0; d < FULL_DIM; d++) {
+            float diff = query[d] - c[d];
+            dist += diff * diff;
+        }
+
+        /* 插入 top-nprobe（最简单的线性插入） */
+        int pos = -1;
+        for (uint32_t i = 0; i < nprobe; i++) {
+            if (dist < out_hits[i].dist) {
+                pos = (int)i;
+                break;
+            }
+        }
+
+        if (pos >= 0) {
+            for (int j = (int)nprobe - 1; j > pos; j--) {
+                out_hits[j] = out_hits[j - 1];
+            }
+            out_hits[pos].cluster_id = cid;
+            out_hits[pos].dist = dist;
+        }
+    }
+
+    return 0;
+}
+
+// 等待query结束
+int wait_query_done(pipeline_app_t *app, uint64_t qid, uint32_t timeout_ms)
+{
+    if (!app || qid == 0) {
+        return -1;
+    }
+
+    const uint32_t sleep_us = 1000; /* 1ms */
+    uint32_t waited_ms = 0;
+
+    while (timeout_ms == 0 || waited_ms < timeout_ms) {
+        pthread_mutex_lock(&app->query_mu);
+
+        for (uint32_t i = 0; i < MAX_QUERIES_IN_FLIGHT; i++) {
+            query_tracker_t *qt = &app->queries[i];
+            if (qt->qid == qid) {
+                bool done = qt->done;
+                pthread_mutex_unlock(&app->query_mu);
+                if (done) {
+                    return 0;
+                }
+                goto not_done;
+            }
+        }
+
+        pthread_mutex_unlock(&app->query_mu);
+        fprintf(stderr, "wait_query_done: qid=%lu not found\n", qid);
+        return -1;
+
+not_done:
+        usleep(sleep_us);
+        waited_ms += 1;
+    }
+
+    return 1; /* timeout */
+}
+
+// 把一个cluster里面的candidate切成batches
+int submit_cluster_candidates(pipeline_app_t *app,
+                              uint64_t qid,
+                              uint32_t cluster_id,
+                              uint32_t max_batch)
+{
+    if (!app || qid == 0 || max_batch == 0) {
+        return -1;
+    }
+
+    const cluster_info_t *ci = find_cluster_info(&app->ivf_meta, cluster_id);
+    if (!ci) {
+        fprintf(stderr, "submit_cluster_candidates: cluster %u not found\n", cluster_id);
+        return -1;
+    }
+
+    uint32_t num_vec = ci->num_vectors;
+    uint32_t local_idx = 0;
+    uint32_t batches_submitted = 0;
+
+    while (local_idx < num_vec) {
+        batch_t *b = (batch_t *)calloc(1, sizeof(*b));
+        if (!b) {
+            perror("calloc batch");
+            return -1;
+        }
+
+        b->magic = MAGIC_BATCH;
+        b->qid = qid;
+        b->stage = 0;
+
+        while (local_idx < num_vec && b->count < max_batch) {
+            b->items[b->count].vec_id = local_idx; /* 第一版先占位 */
+            b->items[b->count].cluster_id = cluster_id;
+            b->items[b->count].local_idx = local_idx;
+            b->items[b->count].partial_sum = 0.0f;
+            b->count++;
+            local_idx++;
+        }
+
+        if (b->count == 0) {
+            free(b);
+            break;
+        }
+
+        pipeline_submit_initial_batch(app, b);
+        batches_submitted++;
+    }
+
+    pthread_mutex_lock(&app->query_mu);
+    for (uint32_t i = 0; i < MAX_QUERIES_IN_FLIGHT; i++) {
+        query_tracker_t *qt = &app->queries[i];
+        if (qt->qid == qid) {
+            qt->initial_candidates += num_vec;
+            qt->submitted_batches += batches_submitted;
+            pthread_mutex_unlock(&app->query_mu);
+            return 0;
+        }
+    }
+    pthread_mutex_unlock(&app->query_mu);
+
+    fprintf(stderr, "submit_cluster_candidates: qid=%lu not registered\n", qid);
+    return -1;
+}
+
+int submit_query(pipeline_app_t *app,
+                 uint64_t qid,
+                 const float *query,
+                 uint32_t nprobe)
+{
+    if (!app || !query || qid == 0) {
+        return -1;
+    }
+
+    if (!app->centroids || app->nlist == 0) {
+        fprintf(stderr, "submit_query: centroids not loaded\n");
+        return -1;
+    }
+
+    if (nprobe == 0 || nprobe > app->nlist) {
+        fprintf(stderr, "submit_query: invalid nprobe=%u nlist=%u\n",
+                nprobe, app->nlist);
+        return -1;
+    }
+
+    /* 1) 切 query segments
+       注意：这要求当前只跑一个query in flight */
+    for (uint32_t i = 0; i < SEG_DIM; i++) {
+        app->query_segs[0][i] = query[i];
+        app->query_segs[1][i] = query[SEG_DIM + i];
+        app->query_segs[2][i] = query[2 * SEG_DIM + i];
+        app->query_segs[3][i] = query[3 * SEG_DIM + i];
+    }
+
+    /* 2) coarse search 选 top-nprobe clusters */
+    coarse_hit_t *hits = (coarse_hit_t *)calloc(nprobe, sizeof(*hits));
+    if (!hits) {
+        perror("calloc coarse hits");
+        return -1;
+    }
+
+    if (coarse_search_topn(query, app->centroids, app->nlist, nprobe, hits) != 0) {
+        fprintf(stderr, "submit_query: coarse_search_topn failed\n");
+        free(hits);
+        return -1;
+    }
+
+    /* 输出一些调试信息 */
+    printf("[submit_query] qid=%lu nprobe=%u\n", qid, nprobe);
+    for (uint32_t i = 0; i < nprobe; i++) {
+        printf("  hit[%u]: cluster=%u dist=%f\n", i, hits[i].cluster_id, hits[i].dist);
+    }
+    fflush(stdout);
+
+    /* 3) 注册 query tracker */
+    query_tracker_t *qt = register_query(app, qid, nprobe, nprobe);
+    if (!qt) {
+        fprintf(stderr, "submit_query: register_query failed qid=%lu\n", qid);
+        free(hits);
+        return -1;
+    }
+
+    /* 4) 依次提交每个命中 cluster 的 candidates */
+    for (uint32_t i = 0; i < nprobe; i++) {
+        uint32_t cluster_id = hits[i].cluster_id;
+
+        if (cluster_id == UINT32_MAX) {
+            continue;
+        }
+
+        if (submit_cluster_candidates(app, qid, cluster_id, MAX_BATCH) != 0) {
+            fprintf(stderr,
+                    "submit_query: submit_cluster_candidates failed qid=%lu cluster=%u\n",
+                    qid, cluster_id);
+            free(hits);
+            return -1;
+        }
+    }
+
+    free(hits);
+
+    /* 可选：检查至少提交了一个batch */
+    pthread_mutex_lock(&app->query_mu);
+    for (uint32_t i = 0; i < MAX_QUERIES_IN_FLIGHT; i++) {
+        query_tracker_t *x = &app->queries[i];
+        if (x->qid == qid) {
+            uint32_t submitted = x->submitted_batches;
+            pthread_mutex_unlock(&app->query_mu);
+            if (submitted == 0) {
+                fprintf(stderr, "submit_query: qid=%lu submitted_batches=0\n", qid);
+                return -1;
+            }
+            return 0;
+        }
+    }
+    pthread_mutex_unlock(&app->query_mu);
+
+    fprintf(stderr, "submit_query: tracker lost for qid=%lu\n", qid);
+    return -1;
+}
+

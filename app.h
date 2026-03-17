@@ -30,6 +30,9 @@
 /* 一个LBA（最小读盘粒度）包含多少个向量的segment*/
 #define SEGMENTS_PER_LBA (IO_BYTES / SEG_BYTES)
 
+/* 最大并发查询数 */
+#define MAX_QUERY_IN_FLIGHT 1024
+
 struct stage_worker;
 struct query_ctx;
 struct cand_batch;
@@ -122,5 +125,4 @@ struct worker_ctx {
     struct spdk_nvme_qpair *qpair;       // 每个 worker 独占一个 qpair
     pthread_t tid;
 };
-
 #endif
