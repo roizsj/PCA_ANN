@@ -80,8 +80,10 @@ int parse_ivf_meta(const char* filename, ivf_meta_t *meta) {
         return -1;
     }
 
+    uint32_t sorted_id_base = 0;
+
     // 读取每个ClusterMeta
-        for (uint32_t i = 0; i < header.nlist; i++) {
+    for (uint32_t i = 0; i < header.nlist; i++) {
         ClusterMetaOnDisk cm;
 
         if (fread(&cm, sizeof(cm), 1, fp) != 1) {
@@ -104,9 +106,53 @@ int parse_ivf_meta(const char* filename, ivf_meta_t *meta) {
         meta->clusters[i].start_lba = cm.start_lba;
         meta->clusters[i].num_vectors = cm.num_vectors;
         meta->clusters[i].num_lbas = cm.num_lbas;
+        meta->clusters[i].sorted_id_base = sorted_id_base;
+        sorted_id_base += cm.num_vectors;
     }
 
     fclose(fp);
+    return 0;
+}
+
+int load_sorted_ids_bin(const char *path, uint32_t *num_vectors_out, uint32_t **sorted_ids_out)
+{
+    if (!path || !num_vectors_out || !sorted_ids_out) {
+        return -1;
+    }
+
+    *num_vectors_out = 0;
+    *sorted_ids_out = NULL;
+
+    FILE *fp = fopen(path, "rb");
+    if (!fp) {
+        perror("fopen sorted ids");
+        return -1;
+    }
+
+    uint32_t num_vectors = 0;
+    if (fread(&num_vectors, sizeof(uint32_t), 1, fp) != 1) {
+        fprintf(stderr, "load_sorted_ids_bin: failed to read count\n");
+        fclose(fp);
+        return -1;
+    }
+
+    uint32_t *sorted_ids = (uint32_t *)malloc((size_t)num_vectors * sizeof(uint32_t));
+    if (!sorted_ids) {
+        perror("malloc sorted ids");
+        fclose(fp);
+        return -1;
+    }
+
+    if (fread(sorted_ids, sizeof(uint32_t), num_vectors, fp) != num_vectors) {
+        fprintf(stderr, "load_sorted_ids_bin: failed to read body\n");
+        free(sorted_ids);
+        fclose(fp);
+        return -1;
+    }
+
+    fclose(fp);
+    *num_vectors_out = num_vectors;
+    *sorted_ids_out = sorted_ids;
     return 0;
 }
 
@@ -491,13 +537,12 @@ static void *topk_thread_main(void *arg) {
             abort();
         }
 
-        for (uint16_t i = 0; i < b->count; i++) {
-            topk_insert(&tw->app->topk_state, b->items[i].vec_id, b->items[i].partial_sum);
-        }
-
         pthread_mutex_lock(&tw->app->query_mu);
         query_tracker_t *qt = find_query_tracker_locked(tw->app, b->qid);
         if (qt) {
+            for (uint16_t i = 0; i < b->count; i++) {
+                topk_insert(&qt->query_topk, b->items[i].vec_id, b->items[i].partial_sum);
+            }
             qt->topk_batches++;
             qt->topk_items += b->count;
             qt->topk_wall_us += now_us() - topk_begin_us;
@@ -596,12 +641,16 @@ static void *stage_worker_main(void *arg) {
         out->qid = in->qid;
         out->stage = in->stage + 1;
 
-        // 从query_tracker_t里面读出query
+        // 从query_tracker_t里面读出query和该query的动态阈值
         const float *query_seg = NULL;
+        float prune_threshold = app->threshold;
         pthread_mutex_lock(&app->query_mu);
         query_tracker_t *qt_for_query = find_query_tracker_locked(app, in->qid);
         if (qt_for_query) {
             query_seg = qt_for_query->query_segs[w->stage_id];
+            if (qt_for_query->prune_threshold > 0.0f) {
+                prune_threshold = qt_for_query->prune_threshold;
+            }
         }
         pthread_mutex_unlock(&app->query_mu);
 
@@ -678,7 +727,7 @@ static void *stage_worker_main(void *arg) {
             acc += part;
 
             /* 3) 提前终止：超过阈值则直接丢弃 */
-            if (acc > app->threshold) {
+            if (acc > prune_threshold) {
                 batch_pruned++;
                 continue;
             }
@@ -805,7 +854,8 @@ int pipeline_init(
     int topk_core,
     float *query_segs[NUM_STAGES],
     float threshold,
-    const char *ivf_meta_path
+    const char *ivf_meta_path,
+    const char *sorted_ids_path
 )
 {
     memset(app, 0, sizeof(*app));
@@ -827,6 +877,23 @@ int pipeline_init(
     /* 读入ivf_meta信息 */
     if (parse_ivf_meta(ivf_meta_path, &app->ivf_meta) != 0) {
         fprintf(stderr, "pipeline_init: failed to load ivf meta from %s\n", ivf_meta_path);
+        return -1;
+    }
+
+    if (load_sorted_ids_bin(sorted_ids_path, &app->num_sorted_vec_ids, &app->sorted_vec_ids) != 0) {
+        fprintf(stderr, "pipeline_init: failed to load sorted ids from %s\n", sorted_ids_path);
+        free_ivf_meta(&app->ivf_meta);
+        return -1;
+    }
+
+    if (app->num_sorted_vec_ids != app->ivf_meta.header.num_vectors) {
+        fprintf(stderr,
+                "pipeline_init: sorted ids count mismatch got=%u expected=%u\n",
+                app->num_sorted_vec_ids, app->ivf_meta.header.num_vectors);
+        free(app->sorted_vec_ids);
+        app->sorted_vec_ids = NULL;
+        app->num_sorted_vec_ids = 0;
+        free_ivf_meta(&app->ivf_meta);
         return -1;
     }
 
@@ -944,6 +1011,9 @@ void pipeline_destroy(pipeline_app_t *app) {
     free(app->centroids);
     app->centroids = NULL;
     app->nlist = 0;
+    free(app->sorted_vec_ids);
+    app->sorted_vec_ids = NULL;
+    app->num_sorted_vec_ids = 0;
     pthread_mutex_destroy(&app->query_mu);
 
     memset(&app->topk_state, 0, sizeof(app->topk_state));
@@ -989,6 +1059,7 @@ query_tracker_t *register_query(pipeline_app_t *app,
             qt->max_outstanding_batches = 0;
             qt->submission_done = false;
             qt->done = false;
+            qt->prune_threshold = 0.0f;
             qt->coarse_search_us = 0;
             qt->submit_candidates_us = 0;
             memset(qt->stage_in, 0, sizeof(qt->stage_in));
@@ -1002,6 +1073,7 @@ query_tracker_t *register_query(pipeline_app_t *app,
             qt->topk_batches = 0;
             qt->topk_items = 0;
             qt->topk_wall_us = 0;
+            memset(&qt->query_topk, 0, sizeof(qt->query_topk));
             memset(qt->query_segs, 0, sizeof(qt->query_segs));
 
             qt->submit_ts_us = now_us();
@@ -1157,6 +1229,14 @@ int submit_cluster_candidates(pipeline_app_t *app,
     uint32_t num_vec = ci->num_vectors;
     uint32_t local_idx = 0;
     uint32_t batches_submitted = 0;
+    uint32_t sorted_base = ci->sorted_id_base;
+
+    if (!app->sorted_vec_ids || sorted_base + num_vec > app->num_sorted_vec_ids) {
+        fprintf(stderr,
+                "submit_cluster_candidates: bad sorted id range cluster=%u base=%u num_vec=%u total=%u\n",
+                cluster_id, sorted_base, num_vec, app->num_sorted_vec_ids);
+        return -1;
+    }
 
     while (local_idx < num_vec) {
         batch_t *b = (batch_t *)calloc(1, sizeof(*b));
@@ -1170,7 +1250,7 @@ int submit_cluster_candidates(pipeline_app_t *app,
         b->stage = 0;
 
         while (local_idx < num_vec && b->count < max_batch) {
-            b->items[b->count].vec_id = local_idx; /* TODO 这里先用了local_idx，后面要改成正确的sorted_idx */
+            b->items[b->count].vec_id = app->sorted_vec_ids[sorted_base + local_idx];
             b->items[b->count].cluster_id = cluster_id;
             b->items[b->count].local_idx = local_idx;
             b->items[b->count].partial_sum = 0.0f;
@@ -1260,7 +1340,15 @@ int submit_query(pipeline_app_t *app,
     }
     qt->coarse_search_us = now_us() - coarse_begin_us;
 
-    printf("[submit_query] qid=%lu nprobe=%u\n", qid, nprobe);
+    uint32_t threshold_rank = nprobe < 10 ? nprobe : 10;
+    if (threshold_rank > 0) {
+        qt->prune_threshold = hits[threshold_rank - 1].dist;
+    } else {
+        qt->prune_threshold = app->threshold;
+    }
+
+    printf("[submit_query] qid=%lu nprobe=%u prune_threshold=%f rank=%u\n",
+           qid, nprobe, qt->prune_threshold, threshold_rank);
     for (uint32_t i = 0; i < nprobe; i++) {
         printf("  hit[%u]: cluster=%u dist=%f\n", i, hits[i].cluster_id, hits[i].dist);
     }

@@ -82,6 +82,7 @@ typedef struct {
     uint64_t start_lba;     // 起始LBA
     uint32_t num_vectors;   // 向量数
     uint32_t num_lbas;      // 占用的LBA数
+    uint32_t sorted_id_base; // 在 sorted_vec_ids.bin 中对应 cluster 的起始偏移
 } cluster_info_t;
 
 // 声明结构体，用于存储完整的IVF元数据
@@ -283,6 +284,7 @@ typedef struct {
     bool done;
 
     /* profile */
+    float prune_threshold;
     uint64_t coarse_search_us;
     uint64_t submit_candidates_us;
     uint64_t stage_in[NUM_STAGES];
@@ -296,6 +298,7 @@ typedef struct {
     uint64_t topk_batches;
     uint64_t topk_items;
     uint64_t topk_wall_us;
+    topk_state_t query_topk;
     uint64_t submit_ts_us;
     uint64_t done_ts_us;
 
@@ -346,6 +349,8 @@ typedef struct pipeline_app {
     /* 新增：coarse centroids */
     uint32_t nlist;
     float *centroids;   // nlist * DIM
+    uint32_t *sorted_vec_ids;
+    uint32_t num_sorted_vec_ids;
 
     /* query 跟踪表 */
     query_tracker_t queries[MAX_QUERIES_IN_FLIGHT];
@@ -416,7 +421,8 @@ int pipeline_init(
     int topk_core,
     float *query_segs[NUM_STAGES],
     float threshold,
-    const char *ivf_meta_path
+    const char *ivf_meta_path,
+    const char *sorted_ids_path
 );
 
 /*
@@ -461,6 +467,7 @@ void pipeline_destroy(pipeline_app_t *app);
  
  
 int load_centroids_bin(const char *path, uint32_t *nlist_out, float **centroids_out);
+int load_sorted_ids_bin(const char *path, uint32_t *num_vectors_out, uint32_t **sorted_ids_out);
 
 int coarse_search_topn(const float *query,
                        const float *centroids,
