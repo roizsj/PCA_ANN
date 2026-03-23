@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <getopt.h>
 #include <sched.h>
 #include <unistd.h>
 
@@ -14,6 +15,88 @@ typedef struct {
     uint32_t k;
     int32_t *ids; /* [n_queries * k] */
 } gt_set_t;
+
+typedef struct {
+    uint32_t max_queries;
+    uint32_t nprobe;
+    bool print_per_query;
+} runtime_options_t;
+
+typedef struct {
+    uint32_t queries;
+    uint64_t latency_us_sum;
+    uint64_t service_us_sum;
+    uint64_t coarse_us_sum;
+    uint64_t submit_us_sum;
+    uint64_t topk_wall_us_sum;
+    double recall_sum;
+    uint64_t stage_in_sum[NUM_STAGES];
+    uint64_t stage_out_sum[NUM_STAGES];
+    uint64_t stage_pruned_sum[NUM_STAGES];
+    uint64_t stage_batches_sum[NUM_STAGES];
+    uint64_t stage_bundles_sum[NUM_STAGES];
+    uint64_t stage_wall_us_sum[NUM_STAGES];
+    uint64_t stage_io_us_sum[NUM_STAGES];
+    uint64_t stage_qsort_us_sum[NUM_STAGES];
+} run_summary_t;
+
+static uint64_t query_service_us(const query_tracker_t *qt);
+
+static void init_runtime_options(runtime_options_t *opts)
+{
+    memset(opts, 0, sizeof(*opts));
+    opts->max_queries = 1;
+    opts->nprobe = 32;
+    opts->print_per_query = false;
+}
+
+static int parse_runtime_options(int argc, char **argv, runtime_options_t *opts)
+{
+    if (!opts) {
+        return -1;
+    }
+
+    init_runtime_options(opts);
+
+    static struct option long_opts[] = {
+        {"max-queries", required_argument, 0, 'm'},
+        {"nprobe", required_argument, 0, 'n'},
+        {"print-per-query", no_argument, 0, 'p'},
+        {"summary-only", no_argument, 0, 's'},
+        {0, 0, 0, 0}
+    };
+
+    int opt = 0;
+    int idx = 0;
+    while ((opt = getopt_long(argc, argv, "", long_opts, &idx)) != -1) {
+        switch (opt) {
+            case 'm':
+                opts->max_queries = (uint32_t)strtoul(optarg, NULL, 10);
+                break;
+            case 'n':
+                opts->nprobe = (uint32_t)strtoul(optarg, NULL, 10);
+                break;
+            case 'p':
+                opts->print_per_query = true;
+                break;
+            case 's':
+                opts->print_per_query = false;
+                break;
+            default:
+                fprintf(stderr,
+                        "Usage: %s [--max-queries N] [--nprobe N] [--print-per-query] [--summary-only]\n",
+                        argv[0]);
+                return -1;
+        }
+    }
+
+    if (opts->nprobe == 0) {
+        fprintf(stderr, "parse_runtime_options: nprobe must be > 0\n");
+        return -1;
+    }
+
+    return 0;
+}
 
 static void free_gt_set(gt_set_t *gt)
 {
@@ -153,13 +236,14 @@ static void print_query_report(const pipeline_app_t *app, uint64_t qid, uint32_t
         }
 
         double latency_ms = 0.0;
+        double service_ms = (double)query_service_us(qt) / 1000.0;
         if (qt->done_ts_us > qt->submit_ts_us) {
             latency_ms = (qt->done_ts_us - qt->submit_ts_us) / 1000.0;
         }
 
         printf("[query tracker] qid=%lu nprobe=%u probed_clusters=%u "
             "initial_candidates=%lu submitted_batches=%u completed_batches=%u "
-            "outstanding=%u max_outstanding=%u done=%d latency_ms=%.3f "
+            "outstanding=%u max_outstanding=%u done=%d latency_ms=%.3f service_ms=%.3f "
             "coarse_ms=%.3f submit_ms=%.3f prune_threshold=%.3f\n",
             qt->qid,
             qt->nprobe,
@@ -171,6 +255,7 @@ static void print_query_report(const pipeline_app_t *app, uint64_t qid, uint32_t
             qt->max_outstanding_batches,
             qt->done ? 1 : 0,
             latency_ms,
+            service_ms,
             (double)qt->coarse_search_us / 1000.0,
             (double)qt->submit_candidates_us / 1000.0,
             qt->prune_threshold);
@@ -234,6 +319,101 @@ static void print_query_report(const pipeline_app_t *app, uint64_t qid, uint32_t
     }
 
     printf("[query tracker] qid=%lu not found\n", qid);
+}
+
+static const query_tracker_t *find_query_tracker_const(const pipeline_app_t *app, uint64_t qid)
+{
+    if (!app || qid == 0) {
+        return NULL;
+    }
+
+    for (uint32_t i = 0; i < MAX_QUERIES_IN_FLIGHT; i++) {
+        if (app->queries[i].qid == qid) {
+            return &app->queries[i];
+        }
+    }
+    return NULL;
+}
+
+static uint64_t query_service_us(const query_tracker_t *qt)
+{
+    if (!qt) {
+        return 0;
+    }
+
+    uint64_t service_us = qt->coarse_search_us + qt->submit_candidates_us + qt->topk_wall_us;
+    for (int s = 0; s < NUM_STAGES; s++) {
+        service_us += qt->stage_wall_us[s];
+    }
+    return service_us;
+}
+
+static void accumulate_query_summary(run_summary_t *sum, const query_tracker_t *qt, double recall10)
+{
+    if (!sum || !qt) {
+        return;
+    }
+
+    sum->queries++;
+    if (qt->done_ts_us > qt->submit_ts_us) {
+        sum->latency_us_sum += qt->done_ts_us - qt->submit_ts_us;
+    }
+    sum->service_us_sum += query_service_us(qt);
+    sum->coarse_us_sum += qt->coarse_search_us;
+    sum->submit_us_sum += qt->submit_candidates_us;
+    sum->topk_wall_us_sum += qt->topk_wall_us;
+    if (recall10 >= 0.0) {
+        sum->recall_sum += recall10;
+    }
+
+    for (int s = 0; s < NUM_STAGES; s++) {
+        sum->stage_in_sum[s] += qt->stage_in[s];
+        sum->stage_out_sum[s] += qt->stage_out[s];
+        sum->stage_pruned_sum[s] += qt->stage_pruned[s];
+        sum->stage_batches_sum[s] += qt->stage_batches[s];
+        sum->stage_bundles_sum[s] += qt->stage_bundles_read[s];
+        sum->stage_wall_us_sum[s] += qt->stage_wall_us[s];
+        sum->stage_io_us_sum[s] += qt->stage_io_us[s];
+        sum->stage_qsort_us_sum[s] += qt->stage_qsort_us[s];
+    }
+}
+
+static void print_run_summary(const run_summary_t *sum, uint32_t nprobe)
+{
+    if (!sum || sum->queries == 0) {
+        printf("[run summary] no queries completed\n");
+        return;
+    }
+
+    printf("[run summary] queries=%u nprobe=%u avg_latency_ms=%.3f avg_coarse_ms=%.3f avg_submit_ms=%.3f avg_recall@%d=%.4f\n",
+           sum->queries,
+           nprobe,
+           (double)sum->latency_us_sum / 1000.0 / (double)sum->queries,
+           (double)sum->coarse_us_sum / 1000.0 / (double)sum->queries,
+           (double)sum->submit_us_sum / 1000.0 / (double)sum->queries,
+           TOPK,
+           sum->recall_sum / (double)sum->queries);
+
+    for (int s = 0; s < NUM_STAGES; s++) {
+        double avg_wall_ms = (double)sum->stage_wall_us_sum[s] / 1000.0 / (double)sum->queries;
+        double avg_io_ms = (double)sum->stage_io_us_sum[s] / 1000.0 / (double)sum->queries;
+        double avg_qsort_ms = (double)sum->stage_qsort_us_sum[s] / 1000.0 / (double)sum->queries;
+        double avg_compute_ms = avg_wall_ms - avg_io_ms - avg_qsort_ms;
+        if (avg_compute_ms < 0.0) {
+            avg_compute_ms = 0.0;
+        }
+        printf("  stage%d avg_in=%.1f avg_out=%.1f avg_pruned=%.1f avg_batches=%.1f avg_bundles=%.1f avg_wall_ms=%.3f avg_io_ms=%.3f avg_qsort_ms=%.3f avg_est_compute_ms=%.3f\n",
+               s,
+               (double)sum->stage_in_sum[s] / (double)sum->queries,
+               (double)sum->stage_out_sum[s] / (double)sum->queries,
+               (double)sum->stage_pruned_sum[s] / (double)sum->queries,
+               (double)sum->stage_batches_sum[s] / (double)sum->queries,
+               (double)sum->stage_bundles_sum[s] / (double)sum->queries,
+               avg_wall_ms,
+               avg_io_ms,
+               avg_qsort_ms,
+               avg_compute_ms);
+    }
 }
 
 static void init_disk_config(disk_ctx_t disks[NUM_STAGES])
@@ -323,8 +503,10 @@ static int probe_all_disks(disk_ctx_t disks[NUM_STAGES])
 
 int main(int argc, char **argv)
 {
-    (void)argc;
-    (void)argv;
+    runtime_options_t runtime_opts;
+    if (parse_runtime_options(argc, argv, &runtime_opts) != 0) {
+        return 1;
+    }
 
     struct spdk_env_opts opts;
     spdk_env_opts_init(&opts);
@@ -444,16 +626,29 @@ int main(int argc, char **argv)
     printf("[main] loaded groundtruth queries=%u k=%u\n", gt.n_queries, gt.k);
     fflush(stdout);
 
-    uint32_t nprobe = 32; /* PARAM nprobe*/
-    uint32_t max_queries_to_run = qs.n_queries < 1 ? qs.n_queries : 1;
+    uint32_t nprobe = runtime_opts.nprobe;
+    uint32_t max_queries_to_run = runtime_opts.max_queries;
+    if (max_queries_to_run == 0 || max_queries_to_run > qs.n_queries) {
+        max_queries_to_run = qs.n_queries;
+    }
     if (max_queries_to_run > gt.n_queries) {
         max_queries_to_run = gt.n_queries;
     }
-    /* 联调时先只跑前 3 个；稳定后改成 qs.n_queries */
 
     uint64_t *submitted_qids = (uint64_t *)calloc(max_queries_to_run, sizeof(*submitted_qids));
     if (!submitted_qids) {
         perror("calloc submitted_qids");
+        free_gt_set(&gt);
+        free_query_set(&qs);
+        pipeline_stop(&app);
+        pipeline_join(&app);
+        pipeline_destroy(&app);
+        return 1;
+    }
+
+    if (qs.dim != FULL_DIM) {
+        fprintf(stderr, "query dim mismatch: got %u expected %d\n", qs.dim, FULL_DIM);
+        free(submitted_qids);
         free_gt_set(&gt);
         free_query_set(&qs);
         pipeline_stop(&app);
@@ -467,13 +662,9 @@ int main(int argc, char **argv)
         uint64_t qid = (uint64_t)qi + 1;
         const float *query = &qs.data[(size_t)qi * (size_t)qs.dim];
 
-        printf("\n[main] submit query qi=%u qid=%lu nprobe=%u\n", qi, qid, nprobe);
-        // printf("[main] first 8 dims: ");
-        // for (uint32_t d = 0; d < 8 && d < qs.dim; d++) {
-        //     printf("%.6f ", query[d]);
-        // }
-        // printf("\n");
-        // fflush(stdout);
+        if (runtime_opts.print_per_query) {
+            printf("\n[main] submit query qi=%u qid=%lu nprobe=%u\n", qi, qid, nprobe);
+        }
 
         if (submit_query(&app, qid, query, nprobe) != 0) {
             fprintf(stderr, "submit_query failed for qid=%lu\n", qid);
@@ -488,9 +679,12 @@ int main(int argc, char **argv)
         submitted_qids[submitted_count++] = qid;
     }
 
+    run_summary_t summary;
+    memset(&summary, 0, sizeof(summary));
+
     for (uint32_t qi = 0; qi < submitted_count; qi++) {
         uint64_t qid = submitted_qids[qi];
-        int wrc = wait_query_done(&app, qid, 10000);  /* 最多等 10 秒 */
+        int wrc = wait_query_done(&app, qid, 10000);
         if (wrc == 1) {
             fprintf(stderr, "wait_query_done timeout for qid=%lu\n", qid);
             free(submitted_qids);
@@ -500,7 +694,8 @@ int main(int argc, char **argv)
             pipeline_join(&app);
             pipeline_destroy(&app);
             return 1;
-        } else if (wrc != 0) {
+        }
+        if (wrc != 0) {
             fprintf(stderr, "wait_query_done error for qid=%lu\n", qid);
             free(submitted_qids);
             free_gt_set(&gt);
@@ -511,36 +706,34 @@ int main(int argc, char **argv)
             return 1;
         }
 
-        /* 打印 query tracker 信息 */
         pthread_mutex_lock(&app.query_mu);
-        print_query_report(&app, qid, qi, &gt);
+        const query_tracker_t *qt = find_query_tracker_const(&app, qid);
+        if (!qt) {
+            pthread_mutex_unlock(&app.query_mu);
+            fprintf(stderr, "query tracker missing for qid=%lu\n", qid);
+            free(submitted_qids);
+            free_gt_set(&gt);
+            free_query_set(&qs);
+            pipeline_stop(&app);
+            pipeline_join(&app);
+            pipeline_destroy(&app);
+            return 1;
+        }
+
+        double recall10 = recall_at_k_overlap(&qt->query_topk, &gt, qi, TOPK);
+        accumulate_query_summary(&summary, qt, recall10);
+        if (runtime_opts.print_per_query) {
+            print_query_report(&app, qid, qi, &gt);
+            fflush(stdout);
+        }
         pthread_mutex_unlock(&app.query_mu);
-        fflush(stdout);
     }
-
-    if (qs.dim != FULL_DIM) {
-        fprintf(stderr, "query dim mismatch: got %u expected %d\n", qs.dim, FULL_DIM);
-        free_gt_set(&gt);
-        free_query_set(&qs);
-        pipeline_stop(&app);
-        pipeline_join(&app);
-        pipeline_destroy(&app);
-        return 1;
-    }
-
-
 
     // 这里必须严格顺序，不然会内存泄漏
     pipeline_stop(&app);
     pipeline_join(&app);
 
-    for (int s = 0; s < NUM_STAGES; s++) {
-        printf("stage%d in=%lu out=%lu pruned=%lu\n",
-            s,
-            app.stage_in[s],
-            app.stage_out[s],
-            app.stage_pruned[s]);
-    }
+    print_run_summary(&summary, nprobe);
     fflush(stdout);
 
     free(submitted_qids);

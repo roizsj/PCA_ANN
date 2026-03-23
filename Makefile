@@ -23,16 +23,11 @@ CFLAGS := -std=c11 -O3 -march=native -g -Wall -Wextra -Wpedantic -Wno-unused-par
 BIN_DIR := build/bin
 
 
-all: $(APP_NAME) populate_fake ivf_write_disk
+all: $(APP_NAME) ivf_write_disk ivf_write_disk_1 ivf_baseline_1
 
 $(APP_NAME): $(SRC)
 	@mkdir -p $(BIN_DIR)
 	$(CC) $(CFLAGS) -o $(BIN_DIR)/$@ $(SRC) -pthread \
-	-Wl,--whole-archive -Wl,-Bstatic $(SPDK_LIBS) \
-	-Wl,-Bdynamic -Wl,--no-whole-archive $(SPDK_SYSLIBS)
-
-populate_fake: populate_fake.c
-	$(CC) $(CFLAGS) -o $(BIN_DIR)/$@ populate_fake.c -pthread \
 	-Wl,--whole-archive -Wl,-Bstatic $(SPDK_LIBS) \
 	-Wl,-Bdynamic -Wl,--no-whole-archive $(SPDK_SYSLIBS)
 
@@ -41,6 +36,15 @@ ivf_write_disk: ivf_write_disk.c
 	-Wl,--whole-archive -Wl,-Bstatic $(SPDK_LIBS) \
 	-Wl,-Bdynamic -Wl,--no-whole-archive $(SPDK_SYSLIBS)
 
+ivf_write_disk_1: ivf_write_disk_1.c
+	$(CC) $(CFLAGS) -o $(BIN_DIR)/$@ ivf_write_disk_1.c -pthread \
+	-Wl,--whole-archive -Wl,-Bstatic $(SPDK_LIBS) \
+	-Wl,-Bdynamic -Wl,--no-whole-archive $(SPDK_SYSLIBS)
+
+ivf_baseline_1: ivf_baseline_1.c query_loader.c
+	@mkdir -p $(BIN_DIR)
+	$(CC) $(CFLAGS) -o $(BIN_DIR)/$@ ivf_baseline_1.c query_loader.c -lm -pthread 	-Wl,--whole-archive -Wl,-Bstatic $(SPDK_LIBS) 	-Wl,-Bdynamic -Wl,--no-whole-archive $(SPDK_SYSLIBS)
+
 clean:
-	rm -f $(BIN_DIR)/$(APP_NAME) $(BIN_DIR)/populate_fake $(BIN_DIR)/ivf_write_disk
+	rm -f $(BIN_DIR)/$(APP_NAME) $(BIN_DIR)/ivf_write_disk $(BIN_DIR)/ivf_write_disk_1 $(BIN_DIR)/ivf_baseline_1
  

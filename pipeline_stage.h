@@ -35,12 +35,6 @@
 /* top-k 大小 */
 #define TOPK 10
 
-/*
- * 每个向量 segment 在盘上占一个 slot，多大由你自己定义。
- * 为了和 NVMe 常见逻辑块大小兼容，先设成 4096 比较稳。
- */
-#define SLOT_BYTES 4096
-
 /* 向量总维度，4-stage 切开后每段维度 */
 #define FULL_DIM 128
 #define SEG_DIM (FULL_DIM / NUM_STAGES)

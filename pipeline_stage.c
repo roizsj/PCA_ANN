@@ -14,6 +14,18 @@ struct io_waiter {
     int ok;
 };
 
+struct bundle_run {
+    uint32_t cluster_id;
+    uint32_t start_bundle;
+    uint32_t bundle_count;
+    uint16_t begin_idx;
+    uint16_t end_idx;
+    uint64_t submit_us;
+    void *buf;
+    struct io_waiter waiter;
+    bool submitted;
+};
+
 static inline uint64_t now_us(void)
 {
     struct timespec ts;
@@ -426,65 +438,127 @@ static void topk_insert(topk_state_t *st, uint32_t vec_id, float dist) {
  *   - 一个 bundle 对应一个 4KB LBA，batch 内同 bundle 的 candidate 复用同一份数据
  * ============================================================ */
 
-static int read_vec_bundle_range(stage_worker_t *w,
-                                 uint32_t cluster_id,
-                                 uint32_t bundle_idx,
-                                 uint32_t bundle_count,
-                                 void *bundle_buf)
+static bool plan_bundle_run(const batch_t *in,
+                            uint16_t start_idx,
+                            uint32_t vectors_per_lba,
+                            uint32_t max_bundles_per_read,
+                            void *buf,
+                            struct bundle_run *run)
+{
+    if (!in || !run || !buf || start_idx >= in->count) {
+        return false;
+    }
+
+    uint32_t cluster_id = in->items[start_idx].cluster_id;
+    uint32_t start_bundle = in->items[start_idx].local_idx / vectors_per_lba;
+    uint32_t bundle_count = 1;
+    uint16_t j = start_idx + 1;
+
+    while (j < in->count) {
+        uint32_t next_cluster_id = in->items[j].cluster_id;
+        uint32_t next_bundle_idx = in->items[j].local_idx / vectors_per_lba;
+
+        if (next_cluster_id != cluster_id) {
+            break;
+        }
+
+        if (next_bundle_idx > start_bundle + bundle_count) {
+            break;
+        }
+
+        if (next_bundle_idx == start_bundle + bundle_count) {
+            if (bundle_count == max_bundles_per_read) {
+                break;
+            }
+            bundle_count++;
+        }
+
+        j++;
+    }
+
+    memset(run, 0, sizeof(*run));
+    run->cluster_id = cluster_id;
+    run->start_bundle = start_bundle;
+    run->bundle_count = bundle_count;
+    run->begin_idx = start_idx;
+    run->end_idx = j;
+    run->buf = buf;
+    return true;
+}
+
+static int submit_vec_bundle_range(stage_worker_t *w, struct bundle_run *run)
 {
     if (!w || !w->app || !w->disk || !w->disk->ns || !w->qpair) {
-        fprintf(stderr, "[read_vec_bundle_range] invalid worker context\n");
+        fprintf(stderr, "[submit_vec_bundle_range] invalid worker context\n");
         return -1;
     }
 
-    if (!bundle_buf || bundle_count == 0) {
-        fprintf(stderr, "[read_vec_bundle_range] invalid buffer/count\n");
+    if (!run || !run->buf || run->bundle_count == 0) {
+        fprintf(stderr, "[submit_vec_bundle_range] invalid run\n");
         return -1;
     }
 
     pipeline_app_t *app = w->app;
     ivf_meta_t *meta = &app->ivf_meta;
 
-    const cluster_info_t *ci = find_cluster_info(meta, cluster_id);
+    const cluster_info_t *ci = find_cluster_info(meta, run->cluster_id);
     if (!ci) {
-        fprintf(stderr, "[read_vec_bundle_range] cluster_id=%u not found\n", cluster_id);
+        fprintf(stderr, "[submit_vec_bundle_range] cluster_id=%u not found\n", run->cluster_id);
         return -1;
     }
 
-    if (bundle_idx >= ci->num_lbas || bundle_count > ci->num_lbas - bundle_idx) {
+    if (run->start_bundle >= ci->num_lbas || run->bundle_count > ci->num_lbas - run->start_bundle) {
         fprintf(stderr,
-                "[read_vec_bundle_range] bundle_idx=%u count=%u out of range cluster=%u num_lbas=%u\n",
-                bundle_idx, bundle_count, cluster_id, ci->num_lbas);
+                "[submit_vec_bundle_range] bundle_idx=%u count=%u out of range cluster=%u num_lbas=%u\n",
+                run->start_bundle, run->bundle_count, run->cluster_id, ci->num_lbas);
         return -1;
     }
 
-    uint64_t lba = ci->start_lba + bundle_idx;
+    uint64_t lba = ci->start_lba + run->start_bundle;
 
-    struct io_waiter waiter = {.done = false, .ok = 0};
+    run->waiter.done = false;
+    run->waiter.ok = 0;
+    run->submit_us = now_us();
+    run->submitted = true;
 
     int rc = spdk_nvme_ns_cmd_read(
         w->disk->ns,
         w->qpair,
-        bundle_buf,
+        run->buf,
         lba,
-        bundle_count,
+        run->bundle_count,
         io_done_cb,
-        &waiter,
+        &run->waiter,
         0
     );
 
     if (rc != 0) {
+        run->submitted = false;
         fprintf(stderr,
-                "[read_vec_bundle_range] read submit failed rc=%d cluster=%u bundle=%u count=%u lba=%lu\n",
-                rc, cluster_id, bundle_idx, bundle_count, lba);
+                "[submit_vec_bundle_range] read submit failed rc=%d cluster=%u bundle=%u count=%u lba=%lu\n",
+                rc, run->cluster_id, run->start_bundle, run->bundle_count, lba);
         return -1;
     }
 
-    while (!waiter.done) {
+    return 0;
+}
+
+static int wait_vec_bundle_range(stage_worker_t *w, struct bundle_run *run, uint64_t *io_us)
+{
+    if (!w || !run || !run->submitted) {
+        return -1;
+    }
+
+    while (!run->waiter.done) {
         spdk_nvme_qpair_process_completions(w->qpair, 0);
     }
 
-    return waiter.ok ? 0 : -1;
+    if (io_us) {
+        *io_us = now_us() - run->submit_us;
+    }
+
+    run->submitted = false;
+    return run->waiter.ok ? 0 : -1;
 }
 /* ============================================================
  * 5. 把一个 batch 转发给下一个 stage
@@ -602,20 +676,38 @@ static void *stage_worker_main(void *arg) {
     // fflush(stdout);
 
     /*
-     * 这个 worker 的临时 DMA buffer。
-     * 一个 batch 最多只有 MAX_BATCH 个 candidate，因此连续 bundle
-     * 的最坏情况也只需要 MAX_BATCH 个 LBA 的缓存空间。
+     * 双缓冲：当前 run 计算时，下一次读可以在另一个 DMA buffer 上飞行。
+     * 一个 batch 最多只有 MAX_BATCH 个 candidate，因此最坏情况下的连续 bundle
+     * 缓冲空间也只需要 MAX_BATCH 个 LBA。
      */
     const size_t buf_bytes = (size_t)w->disk->sector_size * MAX_BATCH;
-    void *buf = spdk_zmalloc(
+    uint32_t max_bundles_per_read = spdk_nvme_ns_get_max_io_xfer_size(w->disk->ns) / w->disk->sector_size;
+    if (max_bundles_per_read == 0) {
+        max_bundles_per_read = 1;
+    }
+
+    void *buf_a = spdk_zmalloc(
         buf_bytes,
         4096,
         NULL,
         SPDK_ENV_NUMA_ID_ANY,
         SPDK_MALLOC_DMA
     );
-    if (!buf) {
-        fprintf(stderr, "spdk_zmalloc failed worker=%d\n", w->worker_id);
+    if (!buf_a) {
+        fprintf(stderr, "spdk_zmalloc failed worker=%d buf_a\n", w->worker_id);
+        return NULL;
+    }
+
+    void *buf_b = spdk_zmalloc(
+        buf_bytes,
+        4096,
+        NULL,
+        SPDK_ENV_NUMA_ID_ANY,
+        SPDK_MALLOC_DMA
+    );
+    if (!buf_b) {
+        fprintf(stderr, "spdk_zmalloc failed worker=%d buf_b\n", w->worker_id);
+        spdk_free(buf_a);
         return NULL;
     }
 
@@ -693,115 +785,127 @@ static void *stage_worker_main(void *arg) {
         const uint32_t vectors_per_lba = app->ivf_meta.header.vectors_per_lba;
         const uint32_t shard_bytes = SEG_DIM * sizeof(float);
 
-        for (uint16_t i = 0; i < in->count; ) {
-            uint32_t run_cluster_id = in->items[i].cluster_id;
-            uint32_t run_start_bundle = in->items[i].local_idx / vectors_per_lba;
-            uint32_t run_bundle_count = 1;
-            uint16_t j = i + 1;
+        if (in->count > 0) {
+            struct bundle_run run_slots[2];
+            struct bundle_run *cur_run = &run_slots[0];
+            struct bundle_run *next_run = &run_slots[1];
+            bool have_cur = plan_bundle_run(in, 0, vectors_per_lba, max_bundles_per_read, buf_a, cur_run);
+            int cur_submit_rc = have_cur ? submit_vec_bundle_range(w, cur_run) : -1;
 
-            while (j < in->count) {
-                uint32_t next_cluster_id = in->items[j].cluster_id;
-                uint32_t next_bundle_idx = in->items[j].local_idx / vectors_per_lba;
+            while (have_cur) {
+                uint64_t run_io_us = 0;
+                int cur_io_rc = cur_submit_rc;
 
-                if (next_cluster_id != run_cluster_id) {
-                    break;
-                }
-
-                if (next_bundle_idx > run_start_bundle + run_bundle_count) {
-                    break;
-                }
-
-                if (next_bundle_idx == run_start_bundle + run_bundle_count) {
-                    run_bundle_count++;
-                }
-
-                j++;
-            }
-
-            uint64_t io_begin_us = now_us();
-            if (read_vec_bundle_range(w, run_cluster_id, run_start_bundle, run_bundle_count, buf) != 0) {
-                batch_io_us += now_us() - io_begin_us;
-                fprintf(stderr,
-                        "[stage %d] merged bundle read failed cluster=%u start_bundle=%u bundle_count=%u disk=%s\n",
-                        w->stage_id, run_cluster_id, run_start_bundle, run_bundle_count, w->disk->traddr);
-                i = j;
-                continue;
-            }
-            batch_io_us += now_us() - io_begin_us;
-            batch_bundles_read += run_bundle_count;
-
-            for (uint16_t k = i; k < j; k++) {
-                uint32_t vec_id = in->items[k].vec_id;
-                uint32_t cluster_id = in->items[k].cluster_id;
-                uint32_t local_idx = in->items[k].local_idx;
-                float acc = in->items[k].partial_sum;
-
-                uint32_t bundle_idx = local_idx / vectors_per_lba;
-                uint32_t lane_idx = local_idx % vectors_per_lba;
-                uint32_t bundle_offset = bundle_idx - run_start_bundle;
-
-                float *seg = (float *)((uint8_t *)buf +
-                                       (size_t)bundle_offset * w->disk->sector_size +
-                                       (size_t)lane_idx * shard_bytes);
-
-                /* 2) 计算 partial distance 并累加 */
-                float part = partial_l2(seg, query_seg);
-                acc += part;
-
-                /* 3) 提前终止：超过阈值则直接丢弃 */
-                if (acc > prune_threshold) {
-                    batch_pruned++;
-                    continue;
-                }
-                batch_out++;
-
-                /* 4) 如果这是最后一个 stage，按 batch 送到 top-k */
-                if (w->stage_id == NUM_STAGES - 1) {
-                    out->items[out->count].vec_id = vec_id;
-                    out->items[out->count].cluster_id = cluster_id;
-                    out->items[out->count].local_idx = local_idx;
-                    out->items[out->count].partial_sum = acc;
-                    out->count++;
-
-                    if (out->count == MAX_BATCH) {
-                        queue_push(&app->topk.inq, out);
-                        child_batches++;
-
-                        out = calloc(1, sizeof(*out));
-                        if (!out) {
-                            perror("calloc final spill batch");
-                            exit(1);
-                        }
-
-                        out->magic = MAGIC_BATCH;
-                        out->qid = in->qid;
-                        out->stage = NUM_STAGES;
+                if (cur_io_rc == 0) {
+                    cur_io_rc = wait_vec_bundle_range(w, cur_run, &run_io_us);
+                    batch_io_us += run_io_us;
+                    if (cur_io_rc == 0) {
+                        batch_bundles_read += cur_run->bundle_count;
                     }
+                }
+
+                bool have_next = false;
+                int next_submit_rc = -1;
+                if (cur_run->end_idx < in->count) {
+                    void *next_buf = (cur_run->buf == buf_a) ? buf_b : buf_a;
+                    have_next = plan_bundle_run(in,
+                                                cur_run->end_idx,
+                                                vectors_per_lba,
+                                                max_bundles_per_read,
+                                                next_buf,
+                                                next_run);
+                    if (have_next) {
+                        next_submit_rc = submit_vec_bundle_range(w, next_run);
+                    }
+                }
+
+                if (cur_io_rc != 0) {
+                    fprintf(stderr,
+                            "[stage %d] merged bundle read failed cluster=%u start_bundle=%u bundle_count=%u disk=%s\n",
+                            w->stage_id,
+                            cur_run->cluster_id,
+                            cur_run->start_bundle,
+                            cur_run->bundle_count,
+                            w->disk->traddr);
                 } else {
-                    out->items[out->count].vec_id = vec_id;
-                    out->items[out->count].cluster_id = cluster_id;
-                    out->items[out->count].local_idx = local_idx;
-                    out->items[out->count].partial_sum = acc;
-                    out->count++;
+                    for (uint16_t k = cur_run->begin_idx; k < cur_run->end_idx; k++) {
+                        uint32_t vec_id = in->items[k].vec_id;
+                        uint32_t cluster_id = in->items[k].cluster_id;
+                        uint32_t local_idx = in->items[k].local_idx;
+                        float acc = in->items[k].partial_sum;
 
-                    if (out->count == MAX_BATCH) {
-                        forward_batch(app, out);
-                        child_batches++;
+                        uint32_t bundle_idx = local_idx / vectors_per_lba;
+                        uint32_t lane_idx = local_idx % vectors_per_lba;
+                        uint32_t bundle_offset = bundle_idx - cur_run->start_bundle;
 
-                        out = calloc(1, sizeof(*out));
-                        if (!out) {
-                            perror("calloc spill batch");
-                            exit(1);
+                        float *seg = (float *)((uint8_t *)cur_run->buf +
+                                               (size_t)bundle_offset * w->disk->sector_size +
+                                               (size_t)lane_idx * shard_bytes);
+
+                        float part = partial_l2(seg, query_seg);
+                        acc += part;
+
+                        if (acc > prune_threshold) {
+                            batch_pruned++;
+                            continue;
                         }
+                        batch_out++;
 
-                        out->magic = MAGIC_BATCH;
-                        out->qid = in->qid;
-                        out->stage = in->stage + 1;
+                        if (w->stage_id == NUM_STAGES - 1) {
+                            out->items[out->count].vec_id = vec_id;
+                            out->items[out->count].cluster_id = cluster_id;
+                            out->items[out->count].local_idx = local_idx;
+                            out->items[out->count].partial_sum = acc;
+                            out->count++;
+
+                            if (out->count == MAX_BATCH) {
+                                queue_push(&app->topk.inq, out);
+                                child_batches++;
+
+                                out = calloc(1, sizeof(*out));
+                                if (!out) {
+                                    perror("calloc final spill batch");
+                                    exit(1);
+                                }
+
+                                out->magic = MAGIC_BATCH;
+                                out->qid = in->qid;
+                                out->stage = NUM_STAGES;
+                            }
+                        } else {
+                            out->items[out->count].vec_id = vec_id;
+                            out->items[out->count].cluster_id = cluster_id;
+                            out->items[out->count].local_idx = local_idx;
+                            out->items[out->count].partial_sum = acc;
+                            out->count++;
+
+                            if (out->count == MAX_BATCH) {
+                                forward_batch(app, out);
+                                child_batches++;
+
+                                out = calloc(1, sizeof(*out));
+                                if (!out) {
+                                    perror("calloc spill batch");
+                                    exit(1);
+                                }
+
+                                out->magic = MAGIC_BATCH;
+                                out->qid = in->qid;
+                                out->stage = in->stage + 1;
+                            }
+                        }
                     }
                 }
-            }
 
-            i = j;
+                if (!have_next) {
+                    break;
+                }
+
+                struct bundle_run *tmp = cur_run;
+                cur_run = next_run;
+                next_run = tmp;
+                cur_submit_rc = next_submit_rc;
+            }
         }
 
         /* 扫完输入 batch 后，把剩余 surviving batch 发出去 */
@@ -853,7 +957,8 @@ static void *stage_worker_main(void *arg) {
         free(in);
     }
 
-    spdk_free(buf);
+    spdk_free(buf_b);
+    spdk_free(buf_a);
     spdk_nvme_ctrlr_free_io_qpair(w->qpair);
     w->qpair = NULL;
     return NULL;
