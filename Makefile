@@ -16,7 +16,7 @@ SPDK_CFLAGS := $(shell pkg-config --cflags $(SPDK_PC_LIBS))
 SPDK_LIBS   := $(shell pkg-config --libs $(SPDK_PC_LIBS))
 SPDK_SYSLIBS := $(shell pkg-config --libs --static spdk_syslibs)
 
-CFLAGS := -std=c11 -O0 -g -Wall -Wextra -Wpedantic -Wno-unused-parameter \
+CFLAGS := -std=c11 -O3 -march=native -g -Wall -Wextra -Wpedantic -Wno-unused-parameter \
           -D_GNU_SOURCE\
           -I$(SPDK_DIR)/include $(SPDK_CFLAGS)
 

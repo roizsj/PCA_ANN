@@ -254,29 +254,66 @@ int main(int argc, char **argv)
                 }
 
                 printf("[query tracker] qid=%lu nprobe=%u probed_clusters=%u "
-                    "initial_candidates=%lu submitted_batches=%u finished_batches=%u done=%d latency_ms=%.3f\n",
+                    "initial_candidates=%lu submitted_batches=%u completed_batches=%u "
+                    "outstanding=%u max_outstanding=%u done=%d latency_ms=%.3f "
+                    "coarse_ms=%.3f submit_ms=%.3f\n",
                     qt->qid,
                     qt->nprobe,
                     qt->num_probed_clusters,
                     qt->initial_candidates,
                     qt->submitted_batches,
-                    qt->finished_batches,
+                    qt->completed_batches,
+                    qt->outstanding_batches,
+                    qt->max_outstanding_batches,
                     qt->done ? 1 : 0,
-                    latency_ms);
+                    latency_ms,
+                    (double)qt->coarse_search_us / 1000.0,
+                    (double)qt->submit_candidates_us / 1000.0);
 
                 for (int s = 0; s < NUM_STAGES; s++) {
                     double prune_ratio = 0.0;
+                    double wall_ms = (double)qt->stage_wall_us[s] / 1000.0;
+                    double io_ms = (double)qt->stage_io_us[s] / 1000.0;
+                    double qsort_ms = (double)qt->stage_qsort_us[s] / 1000.0;
+                    double compute_ms = wall_ms - io_ms - qsort_ms;
+                    if (compute_ms < 0.0) {
+                        compute_ms = 0.0;
+                    }
+                    double avg_batch_ms = 0.0;
+                    double avg_bundle_us = 0.0;
+                    if (qt->stage_batches[s] > 0) {
+                        avg_batch_ms = wall_ms / (double)qt->stage_batches[s];
+                    }
+                    if (qt->stage_bundles_read[s] > 0) {
+                        avg_bundle_us = (double)qt->stage_io_us[s] / (double)qt->stage_bundles_read[s];
+                    }
                     if (qt->stage_in[s] > 0) {
                         prune_ratio = 1.0 - (double)qt->stage_out[s] / (double)qt->stage_in[s];
                     }
-                    printf("  stage%d in=%lu out=%lu pruned=%lu bundles=%lu prune_ratio=%.4f\n",
+                    printf("  stage%d in=%lu out=%lu pruned=%lu batches=%lu bundles=%lu "
+                        "prune_ratio=%.4f wall_ms=%.3f io_ms=%.3f qsort_ms=%.3f "
+                        "est_compute_ms=%.3f avg_batch_ms=%.3f avg_io_per_bundle_us=%.3f\n",
                         s,
                         qt->stage_in[s],
                         qt->stage_out[s],
                         qt->stage_pruned[s],
+                        qt->stage_batches[s],
                         qt->stage_bundles_read[s],
-                        prune_ratio);
+                        prune_ratio,
+                        wall_ms,
+                        io_ms,
+                        qsort_ms,
+                        compute_ms,
+                        avg_batch_ms,
+                        avg_bundle_us);
                 }
+                printf("  topk batches=%lu items=%lu wall_ms=%.3f avg_batch_ms=%.3f\n",
+                    qt->topk_batches,
+                    qt->topk_items,
+                    (double)qt->topk_wall_us / 1000.0,
+                    qt->topk_batches > 0
+                        ? ((double)qt->topk_wall_us / 1000.0) / (double)qt->topk_batches
+                        : 0.0);
                 break;
             }
         }
@@ -310,16 +347,14 @@ int main(int argc, char **argv)
     }
     fflush(stdout);
 
-    pthread_mutex_lock(&app.topk_state.mu);
     printf("topk size=%u\n", app.topk_state.size);
     for (uint32_t i = 0; i < app.topk_state.size; i++) {
         printf("  vec=%u dist=%f\n",
             app.topk_state.items[i].vec_id,
             app.topk_state.items[i].dist);
     }
-    pthread_mutex_unlock(&app.topk_state.mu);
 
     free_query_set(&qs);
-    pipeline_destroy(&app); // 必须先unlock再destroy否则容易错
+    pipeline_destroy(&app);
     return 0;
 }

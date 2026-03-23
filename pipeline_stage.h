@@ -153,12 +153,13 @@ typedef struct {
  * 一个最小 top-k 状态：
  *  - items: 当前 top-k 集合
  *  - size: 当前已有多少个元素
- *  - mu: 保护 top-k 更新的锁
+ *
+ * 当前实现里只有 top-k 线程会写它，主线程只会在 pipeline_join() 之后读取，
+ * 所以这里不再为热路径维护额外的锁。
  */
 typedef struct {
     topk_item_t items[TOPK];
     uint32_t size;
-    pthread_mutex_t mu;
 } topk_state_t;
 
 /* -----------------------------
@@ -272,19 +273,31 @@ typedef struct {
     uint64_t initial_candidates;
     uint32_t submitted_batches;
 
-    /* 完成检测 */
-    uint32_t finished_batches;
+    /* batch 生命周期统计 */
+    uint32_t completed_batches;
+    uint32_t outstanding_batches;
+    uint32_t max_outstanding_batches;
+    bool submission_done;
 
     /* 是否完成 */
     bool done;
 
     /* profile */
+    uint64_t coarse_search_us;
+    uint64_t submit_candidates_us;
     uint64_t stage_in[NUM_STAGES];
     uint64_t stage_out[NUM_STAGES];
     uint64_t stage_pruned[NUM_STAGES];
+    uint64_t stage_batches[NUM_STAGES];
     uint64_t stage_bundles_read[NUM_STAGES];
-    double submit_ts_us;
-    double done_ts_us;
+    uint64_t stage_wall_us[NUM_STAGES];
+    uint64_t stage_io_us[NUM_STAGES];
+    uint64_t stage_qsort_us[NUM_STAGES];
+    uint64_t topk_batches;
+    uint64_t topk_items;
+    uint64_t topk_wall_us;
+    uint64_t submit_ts_us;
+    uint64_t done_ts_us;
 
     /* 为了支持并发，query不能存在worker里，得分开存 */
     float query_segs[NUM_STAGES][SEG_DIM];
@@ -460,7 +473,7 @@ query_tracker_t *register_query(pipeline_app_t *app,
                                 uint32_t nprobe,
                                 uint32_t num_probed_clusters);
 
-void mark_batch_finished(pipeline_app_t *app, uint64_t qid);
+void mark_batch_finished(pipeline_app_t *app, uint64_t qid, uint32_t spawned_batches);
 
 int wait_query_done(pipeline_app_t *app, uint64_t qid, uint32_t timeout_ms);
 
