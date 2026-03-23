@@ -426,13 +426,19 @@ static void topk_insert(topk_state_t *st, uint32_t vec_id, float dist) {
  *   - 一个 bundle 对应一个 4KB LBA，batch 内同 bundle 的 candidate 复用同一份数据
  * ============================================================ */
 
-static int read_vec_bundle(stage_worker_t *w,
-                           uint32_t cluster_id,
-                           uint32_t bundle_idx,
-                           void *bundle_buf)
+static int read_vec_bundle_range(stage_worker_t *w,
+                                 uint32_t cluster_id,
+                                 uint32_t bundle_idx,
+                                 uint32_t bundle_count,
+                                 void *bundle_buf)
 {
     if (!w || !w->app || !w->disk || !w->disk->ns || !w->qpair) {
-        fprintf(stderr, "[read_vec_bundle] invalid worker context\n");
+        fprintf(stderr, "[read_vec_bundle_range] invalid worker context\n");
+        return -1;
+    }
+
+    if (!bundle_buf || bundle_count == 0) {
+        fprintf(stderr, "[read_vec_bundle_range] invalid buffer/count\n");
         return -1;
     }
 
@@ -441,14 +447,14 @@ static int read_vec_bundle(stage_worker_t *w,
 
     const cluster_info_t *ci = find_cluster_info(meta, cluster_id);
     if (!ci) {
-        fprintf(stderr, "[read_vec_bundle] cluster_id=%u not found\n", cluster_id);
+        fprintf(stderr, "[read_vec_bundle_range] cluster_id=%u not found\n", cluster_id);
         return -1;
     }
 
-    if (bundle_idx >= ci->num_lbas) {
+    if (bundle_idx >= ci->num_lbas || bundle_count > ci->num_lbas - bundle_idx) {
         fprintf(stderr,
-                "[read_vec_bundle] bundle_idx=%u out of range cluster=%u num_lbas=%u\n",
-                bundle_idx, cluster_id, ci->num_lbas);
+                "[read_vec_bundle_range] bundle_idx=%u count=%u out of range cluster=%u num_lbas=%u\n",
+                bundle_idx, bundle_count, cluster_id, ci->num_lbas);
         return -1;
     }
 
@@ -461,7 +467,7 @@ static int read_vec_bundle(stage_worker_t *w,
         w->qpair,
         bundle_buf,
         lba,
-        1,              /* 一次只读一个4KB LBA */
+        bundle_count,
         io_done_cb,
         &waiter,
         0
@@ -469,8 +475,8 @@ static int read_vec_bundle(stage_worker_t *w,
 
     if (rc != 0) {
         fprintf(stderr,
-                "[read_vec_bundle] read submit failed rc=%d cluster=%u bundle=%u lba=%lu\n",
-                rc, cluster_id, bundle_idx, lba);
+                "[read_vec_bundle_range] read submit failed rc=%d cluster=%u bundle=%u count=%u lba=%lu\n",
+                rc, cluster_id, bundle_idx, bundle_count, lba);
         return -1;
     }
 
@@ -596,11 +602,13 @@ static void *stage_worker_main(void *arg) {
     // fflush(stdout);
 
     /*
-     * 这个 worker 的临时 DMA buffer
-     * 先用一个 buffer 反复读单个 segment
+     * 这个 worker 的临时 DMA buffer。
+     * 一个 batch 最多只有 MAX_BATCH 个 candidate，因此连续 bundle
+     * 的最坏情况也只需要 MAX_BATCH 个 LBA 的缓存空间。
      */
+    const size_t buf_bytes = (size_t)w->disk->sector_size * MAX_BATCH;
     void *buf = spdk_zmalloc(
-        w->disk->sector_size,
+        buf_bytes,
         4096,
         NULL,
         SPDK_ENV_NUMA_ID_ANY,
@@ -685,98 +693,115 @@ static void *stage_worker_main(void *arg) {
         const uint32_t vectors_per_lba = app->ivf_meta.header.vectors_per_lba;
         const uint32_t shard_bytes = SEG_DIM * sizeof(float);
 
-        uint32_t cur_cluster_id = UINT32_MAX;
-        uint32_t cur_bundle_idx = UINT32_MAX;
-        bool bundle_loaded = false;
+        for (uint16_t i = 0; i < in->count; ) {
+            uint32_t run_cluster_id = in->items[i].cluster_id;
+            uint32_t run_start_bundle = in->items[i].local_idx / vectors_per_lba;
+            uint32_t run_bundle_count = 1;
+            uint16_t j = i + 1;
 
-        for (uint16_t i = 0; i < in->count; i++) {
-            uint32_t vec_id = in->items[i].vec_id;
-            uint32_t cluster_id = in->items[i].cluster_id;
-            uint32_t local_idx = in->items[i].local_idx;
-            float acc = in->items[i].partial_sum;
+            while (j < in->count) {
+                uint32_t next_cluster_id = in->items[j].cluster_id;
+                uint32_t next_bundle_idx = in->items[j].local_idx / vectors_per_lba;
 
-            uint32_t bundle_idx = local_idx / vectors_per_lba;
-            uint32_t lane_idx   = local_idx % vectors_per_lba;
-
-            /* 只有当 (cluster_id, bundle_idx) 变化时，才读一次新的LBA */
-            if (!bundle_loaded ||
-                cluster_id != cur_cluster_id ||
-                bundle_idx != cur_bundle_idx) {
-                uint64_t io_begin_us = now_us();
-
-                if (read_vec_bundle(w, cluster_id, bundle_idx, buf) != 0) {
-                    batch_io_us += now_us() - io_begin_us;
-                    fprintf(stderr,
-                            "[stage %d] bundle read failed cluster=%u bundle=%u disk=%s\n",
-                            w->stage_id, cluster_id, bundle_idx, w->disk->traddr);
-                    bundle_loaded = false;
-                    continue;
+                if (next_cluster_id != run_cluster_id) {
+                    break;
                 }
-                batch_io_us += now_us() - io_begin_us;
 
-                cur_cluster_id = cluster_id;
-                cur_bundle_idx = bundle_idx;
-                bundle_loaded = true;
-                batch_bundles_read++; // 增加计数器
+                if (next_bundle_idx > run_start_bundle + run_bundle_count) {
+                    break;
+                }
+
+                if (next_bundle_idx == run_start_bundle + run_bundle_count) {
+                    run_bundle_count++;
+                }
+
+                j++;
             }
 
-            float *seg = (float *)((uint8_t *)buf + lane_idx * shard_bytes);
-
-            /* 2) 计算 partial distance 并累加 */
-            float part = partial_l2(seg, query_seg);
-            acc += part;
-
-            /* 3) 提前终止：超过阈值则直接丢弃 */
-            if (acc > prune_threshold) {
-                batch_pruned++;
+            uint64_t io_begin_us = now_us();
+            if (read_vec_bundle_range(w, run_cluster_id, run_start_bundle, run_bundle_count, buf) != 0) {
+                batch_io_us += now_us() - io_begin_us;
+                fprintf(stderr,
+                        "[stage %d] merged bundle read failed cluster=%u start_bundle=%u bundle_count=%u disk=%s\n",
+                        w->stage_id, run_cluster_id, run_start_bundle, run_bundle_count, w->disk->traddr);
+                i = j;
                 continue;
             }
-            batch_out++;
+            batch_io_us += now_us() - io_begin_us;
+            batch_bundles_read += run_bundle_count;
 
-            /* 4) 如果这是最后一个 stage，按 batch 送到 top-k */
-            if (w->stage_id == NUM_STAGES - 1) {
-                out->items[out->count].vec_id = vec_id;
-                out->items[out->count].cluster_id = cluster_id;
-                out->items[out->count].local_idx = local_idx;
-                out->items[out->count].partial_sum = acc;
-                out->count++;
+            for (uint16_t k = i; k < j; k++) {
+                uint32_t vec_id = in->items[k].vec_id;
+                uint32_t cluster_id = in->items[k].cluster_id;
+                uint32_t local_idx = in->items[k].local_idx;
+                float acc = in->items[k].partial_sum;
 
-                if (out->count == MAX_BATCH) {
-                    queue_push(&app->topk.inq, out);
-                    child_batches++;
+                uint32_t bundle_idx = local_idx / vectors_per_lba;
+                uint32_t lane_idx = local_idx % vectors_per_lba;
+                uint32_t bundle_offset = bundle_idx - run_start_bundle;
 
-                    out = calloc(1, sizeof(*out));
-                    if (!out) {
-                        perror("calloc final spill batch");
-                        exit(1);
-                    }
+                float *seg = (float *)((uint8_t *)buf +
+                                       (size_t)bundle_offset * w->disk->sector_size +
+                                       (size_t)lane_idx * shard_bytes);
 
-                    out->magic = MAGIC_BATCH;
-                    out->qid = in->qid;
-                    out->stage = NUM_STAGES;
+                /* 2) 计算 partial distance 并累加 */
+                float part = partial_l2(seg, query_seg);
+                acc += part;
+
+                /* 3) 提前终止：超过阈值则直接丢弃 */
+                if (acc > prune_threshold) {
+                    batch_pruned++;
+                    continue;
                 }
-            } else {
-                out->items[out->count].vec_id = vec_id;
-                out->items[out->count].cluster_id = cluster_id;
-                out->items[out->count].local_idx = local_idx;
-                out->items[out->count].partial_sum = acc;
-                out->count++;
+                batch_out++;
 
-                if (out->count == MAX_BATCH) {
-                    forward_batch(app, out);
-                    child_batches++;
+                /* 4) 如果这是最后一个 stage，按 batch 送到 top-k */
+                if (w->stage_id == NUM_STAGES - 1) {
+                    out->items[out->count].vec_id = vec_id;
+                    out->items[out->count].cluster_id = cluster_id;
+                    out->items[out->count].local_idx = local_idx;
+                    out->items[out->count].partial_sum = acc;
+                    out->count++;
 
-                    out = calloc(1, sizeof(*out));
-                    if (!out) {
-                        perror("calloc spill batch");
-                        exit(1);
+                    if (out->count == MAX_BATCH) {
+                        queue_push(&app->topk.inq, out);
+                        child_batches++;
+
+                        out = calloc(1, sizeof(*out));
+                        if (!out) {
+                            perror("calloc final spill batch");
+                            exit(1);
+                        }
+
+                        out->magic = MAGIC_BATCH;
+                        out->qid = in->qid;
+                        out->stage = NUM_STAGES;
                     }
+                } else {
+                    out->items[out->count].vec_id = vec_id;
+                    out->items[out->count].cluster_id = cluster_id;
+                    out->items[out->count].local_idx = local_idx;
+                    out->items[out->count].partial_sum = acc;
+                    out->count++;
 
-                    out->magic = MAGIC_BATCH;
-                    out->qid = in->qid;
-                    out->stage = in->stage + 1;
+                    if (out->count == MAX_BATCH) {
+                        forward_batch(app, out);
+                        child_batches++;
+
+                        out = calloc(1, sizeof(*out));
+                        if (!out) {
+                            perror("calloc spill batch");
+                            exit(1);
+                        }
+
+                        out->magic = MAGIC_BATCH;
+                        out->qid = in->qid;
+                        out->stage = in->stage + 1;
+                    }
                 }
             }
+
+            i = j;
         }
 
         /* 扫完输入 batch 后，把剩余 surviving batch 发出去 */

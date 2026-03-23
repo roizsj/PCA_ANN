@@ -445,7 +445,7 @@ int main(int argc, char **argv)
     fflush(stdout);
 
     uint32_t nprobe = 32; /* PARAM nprobe*/
-    uint32_t max_queries_to_run = qs.n_queries < 20 ? qs.n_queries : 20;
+    uint32_t max_queries_to_run = qs.n_queries < 1 ? qs.n_queries : 1;
     if (max_queries_to_run > gt.n_queries) {
         max_queries_to_run = gt.n_queries;
     }
