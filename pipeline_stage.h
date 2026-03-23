@@ -286,6 +286,9 @@ typedef struct {
     double submit_ts_us;
     double done_ts_us;
 
+    /* 为了支持并发，query不能存在worker里，得分开存 */
+    float query_segs[NUM_STAGES][SEG_DIM];
+
 } query_tracker_t;
 
 /* -----------------------------

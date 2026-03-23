@@ -637,10 +637,9 @@ static void *stage_worker_main(void *arg) {
         }
 
         pipeline_app_t *app = w->app;
-
+        
         /*
-         * out 是 surviving candidates 的新 batch
-         * 将发给下一 stage
+         * 申请out，它是要发给下一个stage的新batch
          */
         batch_t *out = calloc(1, sizeof(*out));
         if (!out) {
@@ -651,6 +650,25 @@ static void *stage_worker_main(void *arg) {
         out->magic = MAGIC_BATCH;
         out->qid = in->qid;
         out->stage = in->stage + 1;
+
+        // 从query_tracker_t里面读出query
+        const float *query_seg = NULL;
+        pthread_mutex_lock(&app->query_mu);
+        query_tracker_t *qt_for_query = find_query_tracker_locked(app, in->qid);
+        if (qt_for_query) {
+            query_seg = qt_for_query->query_segs[w->stage_id];
+        }
+        pthread_mutex_unlock(&app->query_mu);
+
+        if (!query_seg) {
+            fprintf(stderr,
+                    "[stage %d lane %d] query seg not found for qid=%lu\n",
+                    w->stage_id, w->lane_id, in->qid);
+            free(out);
+            free(in);
+            continue;
+        }
+
 
         __sync_fetch_and_add(&app->stage_in[w->stage_id], in->count);
 
@@ -672,7 +690,6 @@ static void *stage_worker_main(void *arg) {
         uint32_t cur_cluster_id = UINT32_MAX;
         uint32_t cur_bundle_idx = UINT32_MAX;
         bool bundle_loaded = false;
-        uint32_t bundles_read = 0; // 计数器，后面可删
 
         for (uint16_t i = 0; i < in->count; i++) {
             uint32_t vec_id = in->items[i].vec_id;
@@ -705,7 +722,7 @@ static void *stage_worker_main(void *arg) {
             float *seg = (float *)((uint8_t *)buf + lane_idx * shard_bytes);
 
             /* 2) 计算 partial distance 并累加 */
-            float part = partial_l2(seg, app->query_segs[w->stage_id]);
+            float part = partial_l2(seg, query_seg);
             acc += part;
 
             /* 3) 提前终止：超过阈值则直接丢弃 */
@@ -741,7 +758,6 @@ static void *stage_worker_main(void *arg) {
                 out->count++;
 
                 if (out->count == MAX_BATCH) {
-                    __sync_fetch_and_add(&app->stage_out[w->stage_id], out->count);
                     forward_batch(app, out);
 
                     out = calloc(1, sizeof(*out));
@@ -976,7 +992,7 @@ void pipeline_destroy(pipeline_app_t *app) {
 /* ============================================================
  * 14.query helper
  * ============================================================ */
-// 注册一个新的 query，返回对应的 tracker 结构体指针
+// 注册一个新的 query，初始化query_tracker_t并返回其指针
 query_tracker_t *register_query(pipeline_app_t *app,
                                 uint64_t qid,
                                 uint32_t nprobe,
@@ -1014,6 +1030,7 @@ query_tracker_t *register_query(pipeline_app_t *app,
             memset(qt->stage_out, 0, sizeof(qt->stage_out));
             memset(qt->stage_pruned, 0, sizeof(qt->stage_pruned));
             memset(qt->stage_bundles_read, 0, sizeof(qt->stage_bundles_read));
+            memset(qt->query_segs, 0, sizeof(qt->query_segs));
 
             qt->submit_ts_us = now_us();
             qt->done_ts_us = 0.0;
@@ -1228,16 +1245,23 @@ int submit_query(pipeline_app_t *app,
         return -1;
     }
 
-    /* 1) 切 query segments
-       注意：这要求当前只跑一个query in flight */
-    for (uint32_t i = 0; i < SEG_DIM; i++) {
-        app->query_segs[0][i] = query[i];
-        app->query_segs[1][i] = query[SEG_DIM + i];
-        app->query_segs[2][i] = query[2 * SEG_DIM + i];
-        app->query_segs[3][i] = query[3 * SEG_DIM + i];
+    /* 1) 注册 query tracker */
+    // TODO 这里有个隐患，注册放在coerce_search的前面，如果coarse_search失败了，tracker就白注册了。后续可以改成先coarse_search，成功后再注册tracker。
+    query_tracker_t *qt = register_query(app, qid, nprobe, nprobe);
+    if (!qt) {
+        fprintf(stderr, "submit_query: register_query failed qid=%lu\n", qid);
+        return -1;
     }
 
-    /* 2) coarse search 选 top-nprobe clusters */
+    /* 2) 切 query segments */
+    for (uint32_t i = 0; i < SEG_DIM; i++) {
+        qt->query_segs[0][i] = query[i];
+        qt->query_segs[1][i] = query[SEG_DIM + i];
+        qt->query_segs[2][i] = query[2 * SEG_DIM + i];
+        qt->query_segs[3][i] = query[3 * SEG_DIM + i];
+    }
+
+    /* 3) coarse search 选 top-nprobe clusters */
     coarse_hit_t *hits = (coarse_hit_t *)calloc(nprobe, sizeof(*hits));
     if (!hits) {
         perror("calloc coarse hits");
@@ -1250,20 +1274,11 @@ int submit_query(pipeline_app_t *app,
         return -1;
     }
 
-    /* 输出一些调试信息 */
     printf("[submit_query] qid=%lu nprobe=%u\n", qid, nprobe);
     for (uint32_t i = 0; i < nprobe; i++) {
         printf("  hit[%u]: cluster=%u dist=%f\n", i, hits[i].cluster_id, hits[i].dist);
     }
     fflush(stdout);
-
-    /* 3) 注册 query tracker */
-    query_tracker_t *qt = register_query(app, qid, nprobe, nprobe);
-    if (!qt) {
-        fprintf(stderr, "submit_query: register_query failed qid=%lu\n", qid);
-        free(hits);
-        return -1;
-    }
 
     /* 4) 依次提交每个命中 cluster 的 candidates */
     for (uint32_t i = 0; i < nprobe; i++) {
@@ -1284,7 +1299,7 @@ int submit_query(pipeline_app_t *app,
 
     free(hits);
 
-    /* 可选：检查至少提交了一个batch */
+    /* 5) 检查至少提交了一个batch */
     pthread_mutex_lock(&app->query_mu);
     for (uint32_t i = 0; i < MAX_QUERIES_IN_FLIGHT; i++) {
         query_tracker_t *x = &app->queries[i];

@@ -210,12 +210,12 @@ int main(int argc, char **argv)
         const float *query = &qs.data[(size_t)qi * (size_t)qs.dim];
 
         printf("\n[main] submit query qi=%u qid=%lu nprobe=%u\n", qi, qid, nprobe);
-        printf("[main] first 8 dims: ");
-        for (uint32_t d = 0; d < 8 && d < qs.dim; d++) {
-            printf("%.6f ", query[d]);
-        }
-        printf("\n");
-        fflush(stdout);
+        // printf("[main] first 8 dims: ");
+        // for (uint32_t d = 0; d < 8 && d < qs.dim; d++) {
+        //     printf("%.6f ", query[d]);
+        // }
+        // printf("\n");
+        // fflush(stdout);
 
         if (submit_query(&app, qid, query, nprobe) != 0) {
             fprintf(stderr, "submit_query failed for qid=%lu\n", qid);
