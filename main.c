@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <getopt.h>
+#include <time.h>
 #include <sched.h>
 #include <unistd.h>
 
@@ -41,6 +42,13 @@ typedef struct {
 } run_summary_t;
 
 static uint64_t query_service_us(const query_tracker_t *qt);
+
+static inline uint64_t now_us(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000ull + (uint64_t)ts.tv_nsec / 1000ull;
+}
 
 static void init_runtime_options(runtime_options_t *opts)
 {
@@ -378,16 +386,23 @@ static void accumulate_query_summary(run_summary_t *sum, const query_tracker_t *
     }
 }
 
-static void print_run_summary(const run_summary_t *sum, uint32_t nprobe)
+static void print_run_summary(const run_summary_t *sum, uint32_t nprobe, uint64_t wall_us)
 {
     if (!sum || sum->queries == 0) {
         printf("[run summary] no queries completed\n");
         return;
     }
 
-    printf("[run summary] queries=%u nprobe=%u avg_latency_ms=%.3f avg_coarse_ms=%.3f avg_submit_ms=%.3f avg_recall@%d=%.4f\n",
+    double qps = 0.0;
+    if (wall_us > 0) {
+        qps = (double)sum->queries * 1000000.0 / (double)wall_us;
+    }
+
+    printf("[run summary] queries=%u nprobe=%u total_wall_ms=%.3f qps=%.3f avg_latency_ms=%.3f avg_coarse_ms=%.3f avg_submit_ms=%.3f avg_recall@%d=%.4f\n",
            sum->queries,
            nprobe,
+           (double)wall_us / 1000.0,
+           qps,
            (double)sum->latency_us_sum / 1000.0 / (double)sum->queries,
            (double)sum->coarse_us_sum / 1000.0 / (double)sum->queries,
            (double)sum->submit_us_sum / 1000.0 / (double)sum->queries,
@@ -503,11 +518,13 @@ static int probe_all_disks(disk_ctx_t disks[NUM_STAGES])
 
 int main(int argc, char **argv)
 {
+     /* 1. 读取参数 + 配置 */
     runtime_options_t runtime_opts;
     if (parse_runtime_options(argc, argv, &runtime_opts) != 0) {
         return 1;
     }
 
+    /* 2. SPDK 初始化 */
     struct spdk_env_opts opts;
     spdk_env_opts_init(&opts);
     opts.name = "spdk_4stage_ann";
@@ -528,13 +545,15 @@ int main(int argc, char **argv)
     }
 
     /* 3. core 配置 */
-    const int stage_cores[NUM_STAGES][WORKERS_PER_STAGE] = {
-        {1, 2, 3, 4},
-        {5, 6, 7, 8},
-        {9, 10, 11, 12},
-        {13, 14, 15, 16}
+    // TODO 如果后面要改每个stage的核数，就改这一行
+    const uint32_t stage_worker_counts[NUM_STAGES] = {6, 4, 4, 4};
+    const int stage_cores[NUM_STAGES][MAX_WORKERS_PER_STAGE] = {
+        {1, 5, 9, 13, 17, 21},
+        {2, 6, 10, 14, 18, 22},
+        {3, 7, 11, 15, 19, 23},
+        {4, 8, 12, 16, 20, 24}
     };
-    int topk_core = 17;
+    int topk_core = 25;
 
     /* 4. query 相关与输入参数配置 */
     static float q0[SEG_DIM], q1[SEG_DIM], q2[SEG_DIM], q3[SEG_DIM];
@@ -567,16 +586,17 @@ int main(int argc, char **argv)
     const char *sorted_ids_path =
         "/home/zhangshujie/ann_ssd/pca_ann/preprocessing/ivf_output/sorted_vec_ids.bin";
 
-    /* 5. 创建 pipeline，并把 probe 好的 disks 传进去 */
+    /* 5. 创建 pipeline 并启动 */
     pipeline_app_t app;
-    if (pipeline_init(&app, disks, stage_cores, topk_core, query_segs, threshold, ivf_meta_path, sorted_ids_path) != 0) {
+    if (pipeline_init(&app, disks, stage_worker_counts, stage_cores, topk_core, query_segs, threshold, ivf_meta_path, sorted_ids_path) != 0) {
         fprintf(stderr, "pipeline_init failed\n");
         return 1;
     }
+    /* 这个init函数里面包含了读ivf_meta.bin, sorted_ids.bin */
 
     pipeline_start(&app);
 
-    // 加载centroids.bin
+    /* 5.1 加载centroids.bin */
     if (load_centroids_bin(centroids_path, &app.nlist, &app.centroids) != 0) {
         fprintf(stderr, "load_centroids_bin failed\n");
         pipeline_stop(&app);
@@ -585,19 +605,20 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    // 检查前几个cluster的信息，确认ivf_meta.bin读入正确
-    for (uint32_t cid = 0; cid < 10 && cid < app.ivf_meta.nlist; cid++) {
-        const cluster_info_t *x = find_cluster_info(&app.ivf_meta, cid);
-        if (x) {
-            printf("cluster %u: start_lba=%lu num_vectors=%u num_lbas=%u\n",
-                cid, x->start_lba, x->num_vectors, x->num_lbas);
-        }
-    }
-    fflush(stdout);
+    // /* 5.2 检查前几个cluster的信息，确认ivf_meta.bin读入正确 */
+    // for (uint32_t cid = 0; cid < 10 && cid < app.ivf_meta.nlist; cid++) {
+    //     const cluster_info_t *x = find_cluster_info(&app.ivf_meta, cid);
+    //     if (x) {
+    //         printf("cluster %u: start_lba=%lu num_vectors=%u num_lbas=%u\n",
+    //             cid, x->start_lba, x->num_vectors, x->num_lbas);
+    //     }
+    // }
+    // fflush(stdout);
 
-    // 6.** 用query_set 替换单个query
+    /* 6.初始化query set */ 
     query_set_t qs;
     memset(&qs, 0, sizeof(qs));
+    /* 6.1 读query并作PCA变换 */ 
     if (prepare_queries_with_pca(query_fvecs_path,
                              pca_mean_path,
                              pca_components_path,
@@ -614,6 +635,7 @@ int main(int argc, char **argv)
     printf("[main] loaded %u PCA queries, dim=%u\n", qs.n_queries, qs.dim);
     fflush(stdout);
 
+    /* 6.2 读groundtruth ids */ 
     gt_set_t gt;
     if (load_ivecs_topk(gt_ivecs_path, &gt) != 0) {
         fprintf(stderr, "load_ivecs_topk failed\n");
@@ -626,6 +648,7 @@ int main(int argc, char **argv)
     printf("[main] loaded groundtruth queries=%u k=%u\n", gt.n_queries, gt.k);
     fflush(stdout);
 
+    /* 一些参数合法性检查 */ 
     uint32_t nprobe = runtime_opts.nprobe;
     uint32_t max_queries_to_run = runtime_opts.max_queries;
     if (max_queries_to_run == 0 || max_queries_to_run > qs.n_queries) {
@@ -657,7 +680,9 @@ int main(int argc, char **argv)
         return 1;
     }
 
+    /* 7. 正式运行，逐个提交query */
     uint32_t submitted_count = 0;
+    uint64_t run_begin_us = now_us();
     for (uint32_t qi = 0; qi < max_queries_to_run; qi++) {
         uint64_t qid = (uint64_t)qi + 1;
         const float *query = &qs.data[(size_t)qi * (size_t)qs.dim];
@@ -682,6 +707,7 @@ int main(int argc, char **argv)
     run_summary_t summary;
     memset(&summary, 0, sizeof(summary));
 
+    /* 8. 异步等待所有query返回 */
     for (uint32_t qi = 0; qi < submitted_count; qi++) {
         uint64_t qid = submitted_qids[qi];
         int wrc = wait_query_done(&app, qid, 10000);
@@ -728,12 +754,13 @@ int main(int argc, char **argv)
         }
         pthread_mutex_unlock(&app.query_mu);
     }
+    uint64_t run_wall_us = now_us() - run_begin_us;
 
     // 这里必须严格顺序，不然会内存泄漏
     pipeline_stop(&app);
     pipeline_join(&app);
 
-    print_run_summary(&summary, nprobe);
+    print_run_summary(&summary, nprobe, run_wall_us);
     fflush(stdout);
 
     free(submitted_qids);

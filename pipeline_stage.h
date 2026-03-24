@@ -26,11 +26,11 @@
 /* 4-stage pipeline */
 #define NUM_STAGES 4
 
-/* 每个 stage 绑定多少个 worker / CPU 核 */
-#define WORKERS_PER_STAGE 4
+/* 每个 stage 最多绑定多少个 worker / CPU 核 */
+#define MAX_WORKERS_PER_STAGE 6
 
 /* 单个 batch 最多容纳多少个 candidate */
-#define MAX_BATCH 128
+#define MAX_BATCH 256
 
 /* top-k 大小 */
 #define TOPK 10
@@ -315,10 +315,12 @@ typedef struct pipeline_app {
     /*
      * workers[stage][lane]
      * 例如：
-     *   workers[0][0..3] -> stage0 的 4 个 worker
-     *   workers[1][0..3] -> stage1 的 4 个 worker
+     *   workers[0][0..stage_worker_counts[0]-1] -> stage0 的 worker
+     *   workers[1][0..stage_worker_counts[1]-1] -> stage1 的 worker
      */
-    stage_worker_t workers[NUM_STAGES][WORKERS_PER_STAGE];
+    stage_worker_t workers[NUM_STAGES][MAX_WORKERS_PER_STAGE];
+    uint32_t stage_worker_counts[NUM_STAGES];
+    uint32_t stage_rr_cursor[NUM_STAGES];
 
     /* top-k 线程 */
     topk_worker_t topk;
@@ -397,11 +399,13 @@ const cluster_info_t *find_cluster_info(const ivf_meta_t *meta, uint32_t cluster
  * 注意：
  *  - 这里不做 nvme_probe！
  *  - 传入的 disks[] 必须已经在 main.c 里 probe 完成
- *  - stage_cores 决定每个 stage 的 4 个 worker 各绑哪个核
+ *  - stage_worker_counts 决定每个 stage 启用多少个 worker
+ *  - stage_cores 决定每个 stage 的 worker 各绑哪个核
  *
  * 参数说明：
  *  - app: pipeline 总上下文
  *  - disks: 已经 probe 完成的 4 块盘
+ *  - stage_worker_counts: 每个 stage 启用的 worker 数
  *  - stage_cores: 每个 stage 的 worker -> CPU core 映射
  *  - topk_core: top-k worker 绑定到哪个核
  *  - query_segs: query 的 4 个 segment
@@ -411,7 +415,8 @@ const cluster_info_t *find_cluster_info(const ivf_meta_t *meta, uint32_t cluster
 int pipeline_init(
     pipeline_app_t *app,
     disk_ctx_t disks[NUM_STAGES],
-    const int stage_cores[NUM_STAGES][WORKERS_PER_STAGE],
+    const uint32_t stage_worker_counts[NUM_STAGES],
+    const int stage_cores[NUM_STAGES][MAX_WORKERS_PER_STAGE],
     int topk_core,
     float *query_segs[NUM_STAGES],
     float threshold,
@@ -421,7 +426,7 @@ int pipeline_init(
 
 /*
  * 启动所有 worker 线程：
- *  - 16 个 stage worker
+ *  - 若干个 stage worker
  *  - 1 个 top-k worker
  */
 void pipeline_start(pipeline_app_t *app);

@@ -13,7 +13,7 @@
 #include <spdk/util.h>
 
 #define NUM_STAGES 4  // 流水线段数目
-#define WORKERS_PER_DISK 4 // 每个盘绑多少个核
+
 #define TOTAL_WORKERS (NUM_STAGES * WORKERS_PER_DISK) // 盘一共用多少个核
 #define TOPK 10
 
@@ -31,7 +31,7 @@
 #define SEGMENTS_PER_LBA (IO_BYTES / SEG_BYTES)
 
 /* 最大并发查询数 */
-#define MAX_QUERY_IN_FLIGHT 1024
+#define MAX_QUERY_IN_FLIGHT 10000
 
 struct stage_worker;
 struct query_ctx;

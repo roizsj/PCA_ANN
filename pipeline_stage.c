@@ -356,11 +356,20 @@ float partial_l2(const float *x, const float *q) {
 
 /*
  * 作用：
- *   同一个 stage 有 4 个 worker，这里用 cluster_id和local_idx做一个简单的hash，决定发哪个worker。
- *   后面如果你想换成 batch hash / round-robin，都可以改这里。
+ *   每个 stage 按自己的轮转游标分发 batch，避免同 cluster 的初始 batch 长时间黏在同一个 lane 上。
  */
-static int pick_lane(uint32_t cluster_id, uint32_t local_idx) {
-    return (cluster_id ^ local_idx) % WORKERS_PER_STAGE;
+static int pick_lane_rr(pipeline_app_t *app, uint32_t stage_id) {
+    if (!app || stage_id >= NUM_STAGES) {
+        return 0;
+    }
+
+    uint32_t worker_count = app->stage_worker_counts[stage_id];
+    if (worker_count == 0) {
+        return 0;
+    }
+
+    uint32_t ticket = __atomic_fetch_add(&app->stage_rr_cursor[stage_id], 1u, __ATOMIC_RELAXED);
+    return (int)(ticket % worker_count);
 }
 
 /*
@@ -584,7 +593,7 @@ static void forward_batch(pipeline_app_t *app, batch_t *b) {
         return;
     }
 
-    int lane = pick_lane(b->items[0].cluster_id, b->items[0].local_idx); // 这里只用vec[0]的id做分流
+    int lane = pick_lane_rr(app, b->stage);
     queue_push(&app->workers[b->stage][lane].inq, b);
 }
 
@@ -980,7 +989,8 @@ static void *stage_worker_main(void *arg) {
 int pipeline_init(
     pipeline_app_t *app,
     disk_ctx_t disks[NUM_STAGES],
-    const int stage_cores[NUM_STAGES][WORKERS_PER_STAGE],
+    const uint32_t stage_worker_counts[NUM_STAGES],
+    const int stage_cores[NUM_STAGES][MAX_WORKERS_PER_STAGE],
     int topk_core,
     float *query_segs[NUM_STAGES],
     float threshold,
@@ -1010,6 +1020,7 @@ int pipeline_init(
         return -1;
     }
 
+    /* 读入 sorted_ids信息 */
     if (load_sorted_ids_bin(sorted_ids_path, &app->num_sorted_vec_ids, &app->sorted_vec_ids) != 0) {
         fprintf(stderr, "pipeline_init: failed to load sorted ids from %s\n", sorted_ids_path);
         free_ivf_meta(&app->ivf_meta);
@@ -1036,15 +1047,31 @@ int pipeline_init(
     app->topk.app = app;
     app->topk.core_id = topk_core;
 
-    /* 初始化 4 x 4 个 stage worker */
+    /* 初始化各 stage 的 worker */
     int worker_id = 0;
     for (int s = 0; s < NUM_STAGES; s++) {
-        for (int lane = 0; lane < WORKERS_PER_STAGE; lane++) {
+        uint32_t worker_count = stage_worker_counts[s];
+        if (worker_count == 0 || worker_count > MAX_WORKERS_PER_STAGE) {
+            fprintf(stderr,
+                    "pipeline_init: invalid worker count stage=%d count=%u max=%d\n",
+                    s, worker_count, MAX_WORKERS_PER_STAGE);
+            free(app->sorted_vec_ids);
+            app->sorted_vec_ids = NULL;
+            app->num_sorted_vec_ids = 0;
+            free_ivf_meta(&app->ivf_meta);
+            pthread_mutex_destroy(&app->query_mu);
+            return -1;
+        }
+
+        app->stage_worker_counts[s] = worker_count;
+        app->stage_rr_cursor[s] = 0;
+
+        for (uint32_t lane = 0; lane < worker_count; lane++) {
             stage_worker_t *w = &app->workers[s][lane];
             w->app = app;
             w->worker_id = worker_id++;
             w->stage_id = s;
-            w->lane_id = lane;
+            w->lane_id = (int)lane;
             w->core_id = stage_cores[s][lane];
             w->disk = &app->disks[s];
             w->qpair = NULL;
@@ -1063,7 +1090,7 @@ void pipeline_start(pipeline_app_t *app) {
     pthread_create(&app->topk.tid, NULL, topk_thread_main, &app->topk);
 
     for (int s = 0; s < NUM_STAGES; s++) {
-        for (int lane = 0; lane < WORKERS_PER_STAGE; lane++) {
+        for (uint32_t lane = 0; lane < app->stage_worker_counts[s]; lane++) {
             pthread_create(&app->workers[s][lane].tid, NULL,
                            stage_worker_main, &app->workers[s][lane]);
         }
@@ -1080,7 +1107,7 @@ void pipeline_submit_initial_batch(pipeline_app_t *app, batch_t *b) {
         abort();
     }
 
-    int lane = pick_lane(b->items[0].cluster_id, b->items[0].local_idx); // 这里只用vec[0]的id做分流
+    int lane = pick_lane_rr(app, 0);
     queue_push(&app->workers[0][lane].inq, b);
     // 调试用输出
     // printf("[submit] qid=%lu stage=%u count=%u first_cluster=%u first_local=%u\n",
@@ -1095,7 +1122,7 @@ void pipeline_submit_initial_batch(pipeline_app_t *app, batch_t *b) {
 
 void pipeline_stop(pipeline_app_t *app) {
     for (int s = 0; s < NUM_STAGES; s++) {
-        for (int lane = 0; lane < WORKERS_PER_STAGE; lane++) {
+        for (uint32_t lane = 0; lane < app->stage_worker_counts[s]; lane++) {
             queue_close(&app->workers[s][lane].inq);
         }
     }
@@ -1108,7 +1135,7 @@ void pipeline_stop(pipeline_app_t *app) {
 void pipeline_join(pipeline_app_t *app) {
     /* 1. 先等所有 stage worker 退出 */
     for (int s = 0; s < NUM_STAGES; s++) {
-        for (int lane = 0; lane < WORKERS_PER_STAGE; lane++) {
+        for (uint32_t lane = 0; lane < app->stage_worker_counts[s]; lane++) {
             pthread_join(app->workers[s][lane].tid, NULL);
         }
     }
@@ -1129,7 +1156,7 @@ void pipeline_destroy(pipeline_app_t *app) {
     free_ivf_meta(&app->ivf_meta);
 
     for (int s = 0; s < NUM_STAGES; s++) {
-        for (int lane = 0; lane < WORKERS_PER_STAGE; lane++) {
+        for (uint32_t lane = 0; lane < app->stage_worker_counts[s]; lane++) {
             pthread_mutex_destroy(&app->workers[s][lane].inq.mu);
             pthread_cond_destroy(&app->workers[s][lane].inq.cv);
         }
