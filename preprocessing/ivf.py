@@ -3,7 +3,7 @@ import numpy as np
 from sklearn.cluster import MiniBatchKMeans
 
 
-DIM = 128
+DIM = 960
 
 
 def read_fvecs(path: str) -> np.ndarray:
