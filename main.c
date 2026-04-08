@@ -20,6 +20,10 @@ typedef struct {
 typedef struct {
     uint32_t max_queries;
     uint32_t nprobe;
+    uint32_t read_depth;
+    uint32_t stage1_gap_merge_limit;
+    const char *coarse_backend;
+    const char *iova_mode;
     bool print_per_query;
 } runtime_options_t;
 
@@ -55,6 +59,10 @@ static void init_runtime_options(runtime_options_t *opts)
     memset(opts, 0, sizeof(*opts));
     opts->max_queries = 1;
     opts->nprobe = 32;
+    opts->read_depth = 8;
+    opts->stage1_gap_merge_limit = 1;
+    opts->coarse_backend = "faiss";
+    opts->iova_mode = NULL;
     opts->print_per_query = false;
 }
 
@@ -69,6 +77,10 @@ static int parse_runtime_options(int argc, char **argv, runtime_options_t *opts)
     static struct option long_opts[] = {
         {"max-queries", required_argument, 0, 'm'},
         {"nprobe", required_argument, 0, 'n'},
+        {"read-depth", required_argument, 0, 'r'},
+        {"stage1-gap-merge", required_argument, 0, 'g'},
+        {"coarse-backend", required_argument, 0, 'c'},
+        {"iova-mode", required_argument, 0, 'i'},
         {"print-per-query", no_argument, 0, 'p'},
         {"summary-only", no_argument, 0, 's'},
         {0, 0, 0, 0}
@@ -84,6 +96,18 @@ static int parse_runtime_options(int argc, char **argv, runtime_options_t *opts)
             case 'n':
                 opts->nprobe = (uint32_t)strtoul(optarg, NULL, 10);
                 break;
+            case 'r':
+                opts->read_depth = (uint32_t)strtoul(optarg, NULL, 10);
+                break;
+            case 'g':
+                opts->stage1_gap_merge_limit = (uint32_t)strtoul(optarg, NULL, 10);
+                break;
+            case 'c':
+                opts->coarse_backend = optarg;
+                break;
+            case 'i':
+                opts->iova_mode = optarg;
+                break;
             case 'p':
                 opts->print_per_query = true;
                 break;
@@ -92,7 +116,7 @@ static int parse_runtime_options(int argc, char **argv, runtime_options_t *opts)
                 break;
             default:
                 fprintf(stderr,
-                        "Usage: %s [--max-queries N] [--nprobe N] [--print-per-query] [--summary-only]\n",
+                        "Usage: %s [--max-queries N] [--nprobe N] [--read-depth N] [--stage1-gap-merge N] [--coarse-backend brute|faiss] [--iova-mode pa|va] [--print-per-query] [--summary-only]\n",
                         argv[0]);
                 return -1;
         }
@@ -100,6 +124,29 @@ static int parse_runtime_options(int argc, char **argv, runtime_options_t *opts)
 
     if (opts->nprobe == 0) {
         fprintf(stderr, "parse_runtime_options: nprobe must be > 0\n");
+        return -1;
+    }
+    if (opts->read_depth == 0 || opts->read_depth > MAX_BATCH) {
+        fprintf(stderr, "parse_runtime_options: read-depth must be in [1, %d]\n", MAX_BATCH);
+        return -1;
+    }
+    if (opts->stage1_gap_merge_limit > MAX_BATCH) {
+        fprintf(stderr, "parse_runtime_options: stage1-gap-merge must be in [0, %d]\n", MAX_BATCH);
+        return -1;
+    }
+    if (strcmp(opts->coarse_backend, "brute") != 0 &&
+        strcmp(opts->coarse_backend, "faiss") != 0) {
+        fprintf(stderr,
+                "parse_runtime_options: coarse-backend must be 'brute' or 'faiss' (got=%s)\n",
+                opts->coarse_backend);
+        return -1;
+    }
+    if (opts->iova_mode &&
+        strcmp(opts->iova_mode, "pa") != 0 &&
+        strcmp(opts->iova_mode, "va") != 0) {
+        fprintf(stderr,
+                "parse_runtime_options: iova-mode must be 'pa' or 'va' (got=%s)\n",
+                opts->iova_mode);
         return -1;
     }
 
@@ -526,9 +573,14 @@ int main(int argc, char **argv)
 
     /* 2. SPDK 初始化 */
     struct spdk_env_opts opts;
+    memset(&opts, 0, sizeof(opts));
     spdk_env_opts_init(&opts);
+    opts.opts_size = sizeof(opts);
     opts.name = "spdk_4stage_ann";
     opts.mem_size = 1024;
+    if (runtime_opts.iova_mode) {
+        opts.iova_mode = runtime_opts.iova_mode;
+    }
 
     if (spdk_env_init(&opts) < 0) {
         fprintf(stderr, "spdk_env_init failed\n");
@@ -556,54 +608,36 @@ int main(int argc, char **argv)
     int topk_core = 25;
 
     /* 4. query 相关与输入参数配置 */
-    static float q0[SEG_DIM], q1[SEG_DIM], q2[SEG_DIM], q3[SEG_DIM];
-    float *query_segs[NUM_STAGES] = {q0, q1, q2, q3};
-
-    for (int i = 0; i < SEG_DIM; i++) {
-        q0[i] = 0.0f;
-        q1[i] = 0.0f;
-        q2[i] = 0.0f;
-        q3[i] = 0.0f;
-    }
-
     float threshold = 80000.0f; // fallback 阈值；正常情况下会被每个 query 的动态阈值覆盖
     const char *ivf_meta_path = 
-        "/home/zhangshujie/ann_ssd/pca_ann/preprocessing/ivf_output/ivf_meta.bin"; // ivf_meta的路径
-    const char *centroids_path = 
-        "/home/zhangshujie/ann_ssd/pca_ann/preprocessing/ivf_output/centroids_4096.bin"; // centroids.bin
+        "/home/zhangshujie/ann_ssd/pca_ann/preprocessing/gist1m_output/ivf_meta.bin"; // ivf_meta_flex 的路径
     const char *query_fvecs_path =
-        "/home/zhangshujie/ann_nic/sift/sift_query.fvecs";
+        "/home/zhangshujie/ann_nic/gist/gist_query.fvecs";
     const char *gt_ivecs_path =
-        "/home/zhangshujie/ann_nic/sift/sift_groundtruth.ivecs";
+        "/home/zhangshujie/ann_nic/gist/gist_groundtruth.ivecs";
     const char *pca_mean_path =
-        "/home/zhangshujie/ann_ssd/pca_ann/preprocessing/pca_output/pca_mean.bin";
+        "/home/zhangshujie/ann_ssd/pca_ann/preprocessing/gist1m_output/gist_pca_mean.bin";
     const char *pca_components_path =
-        "/home/zhangshujie/ann_ssd/pca_ann/preprocessing/pca_output/pca_components.bin";
+        "/home/zhangshujie/ann_ssd/pca_ann/preprocessing/gist1m_output/gist_pca_components.bin";
     const char *pca_ev_path =
-        "/home/zhangshujie/ann_ssd/pca_ann/preprocessing/pca_output/pca_explained_variance.bin";
+        "/home/zhangshujie/ann_ssd/pca_ann/preprocessing/gist1m_output/gist_pca_explained_variance.bin";
     const char *pca_meta_path =
-        "/home/zhangshujie/ann_ssd/pca_ann/preprocessing/pca_output/pca_meta.bin";
+        "/home/zhangshujie/ann_ssd/pca_ann/preprocessing/gist1m_output/gist_pca_meta.bin";
     const char *sorted_ids_path =
-        "/home/zhangshujie/ann_ssd/pca_ann/preprocessing/ivf_output/sorted_vec_ids.bin";
+        "/home/zhangshujie/ann_ssd/pca_ann/preprocessing/gist1m_output/sorted_ids.bin";
 
     /* 5. 创建 pipeline 并启动 */
     pipeline_app_t app;
-    if (pipeline_init(&app, disks, stage_worker_counts, stage_cores, topk_core, query_segs, threshold, ivf_meta_path, sorted_ids_path) != 0) {
+    if (pipeline_init(&app, disks, stage_worker_counts, stage_cores, topk_core,
+                      runtime_opts.read_depth, runtime_opts.stage1_gap_merge_limit,
+                      runtime_opts.coarse_backend,
+                      threshold, ivf_meta_path, sorted_ids_path) != 0) {
         fprintf(stderr, "pipeline_init failed\n");
         return 1;
     }
-    /* 这个init函数里面包含了读ivf_meta.bin, sorted_ids.bin */
+    /* 这个 init 函数里面包含了读 ivf_meta_flex.bin 和 sorted_ids.bin */
 
     pipeline_start(&app);
-
-    /* 5.1 加载centroids.bin */
-    if (load_centroids_bin(centroids_path, &app.nlist, &app.centroids) != 0) {
-        fprintf(stderr, "load_centroids_bin failed\n");
-        pipeline_stop(&app);
-        pipeline_join(&app);
-        pipeline_destroy(&app);
-        return 1;
-    }
 
     // /* 5.2 检查前几个cluster的信息，确认ivf_meta.bin读入正确 */
     // for (uint32_t cid = 0; cid < 10 && cid < app.ivf_meta.nlist; cid++) {
@@ -669,8 +703,9 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    if (qs.dim != FULL_DIM) {
-        fprintf(stderr, "query dim mismatch: got %u expected %d\n", qs.dim, FULL_DIM);
+    if (qs.dim != app.ivf_meta.header.dim) {
+        fprintf(stderr, "query dim mismatch: got %u expected %u\n",
+                qs.dim, app.ivf_meta.header.dim);
         free(submitted_qids);
         free_gt_set(&gt);
         free_query_set(&qs);

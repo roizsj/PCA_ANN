@@ -19,6 +19,13 @@
 #include <spdk/env.h>
 #include <spdk/nvme.h>
 
+typedef struct coarse_search_module coarse_search_module_t;
+
+typedef enum {
+    COARSE_BACKEND_BRUTE = 0,
+    COARSE_BACKEND_FAISS = 1,
+} coarse_backend_t;
+
 /* -----------------------------
  * 全局常量
  * ----------------------------- */
@@ -35,15 +42,12 @@
 /* top-k 大小 */
 #define TOPK 10
 
-/* 向量总维度，4-stage 切开后每段维度 */
-#define FULL_DIM 128
-#define SEG_DIM (FULL_DIM / NUM_STAGES)
-
 /*
  * 用于识别 batch 是否被写坏 / 传错指针。
  * debug 时非常有用。
  */
 #define MAGIC_BATCH 0xBADC0DEu
+#define IVF_META_MAGIC_FLEX 0x49564634u
 
 #define MAX_QUERIES_IN_FLIGHT 1024
 
@@ -51,18 +55,21 @@
  * cluster metadata 数据结构
  * ----------------------------- */
 
-// 盘上存Cluster Metadata的结构体，和写盘文件里面用来存文件的结构体一致
 typedef struct {
     uint32_t cluster_id;
     uint64_t start_lba;
     uint32_t num_vectors;
     uint32_t num_lbas;
-    float centroid[128];
 } ClusterMetaOnDisk;
 
-// 声明结构体，用于存储IVF元数据头部信息
 typedef struct {
-    uint32_t shard_dim;        // 分片维度
+    uint32_t magic;
+    uint32_t version;
+    uint32_t dim;              // 全量向量维度
+    uint32_t num_shards;       // 当前固定为 4
+    uint32_t shard_dims[NUM_STAGES];
+    uint32_t shard_offsets[NUM_STAGES];
+    uint32_t shard_bytes[NUM_STAGES];
     uint32_t vectors_per_lba;  // 每个LBA的向量数
     uint32_t nlist;            // 聚类数量
     uint32_t num_vectors;      // 总向量数
@@ -84,6 +91,7 @@ typedef struct {
     ivf_meta_header_t header;  // 头部信息
     cluster_info_t* clusters;  // 聚类信息数组
     uint32_t nlist;            // 聚类数量（与header.nlist相同）
+    float *centroids;          // [nlist * dim]
 } ivf_meta_t;
 
 
@@ -251,8 +259,8 @@ typedef struct {
 // query对象
 typedef struct {
     uint64_t qid;
-    float full_query[FULL_DIM];              // 128维完整query
-    float *query_segs[NUM_STAGES];      // 指向4个32维segment
+    float *full_query;
+    float *query_segs[NUM_STAGES];
     uint32_t nprobe;
 } query_ctx_t;
 
@@ -297,7 +305,7 @@ typedef struct {
     uint64_t done_ts_us;
 
     /* 为了支持并发，query不能存在worker里，得分开存 */
-    float query_segs[NUM_STAGES][SEG_DIM];
+    float *query_segs[NUM_STAGES];
 
 } query_tracker_t;
 
@@ -325,11 +333,17 @@ typedef struct pipeline_app {
     /* top-k 线程 */
     topk_worker_t topk;
 
-    /* query 被切成 4 段后的 segment 指针 */
-    float *query_segs[NUM_STAGES]; // TODO 这个可能会有很多query
-
     /* 提前终止阈值 */
     float threshold;
+
+    /* 每个 stage worker 允许挂起的读请求深度 */
+    uint32_t read_depth;
+
+    /* stage1 允许跨过的空 bundle 数量 */
+    uint32_t stage1_gap_merge_limit;
+
+    /* coarse search backend */
+    coarse_backend_t coarse_backend;
 
     /* 一些简单统计 */
     uint64_t stage_in[NUM_STAGES];
@@ -342,9 +356,10 @@ typedef struct pipeline_app {
     ivf_meta_t ivf_meta; 
 
 
-    /* 新增：coarse centroids */
+    /* coarse centroids / ivf metadata */
     uint32_t nlist;
-    float *centroids;   // nlist * DIM
+    float *centroids;   // nlist * dim
+    coarse_search_module_t *coarse_module;
     uint32_t *sorted_vec_ids;
     uint32_t num_sorted_vec_ids;
 
@@ -378,7 +393,7 @@ void *queue_pop(ptr_queue_t *q);
 void bind_to_core(int core_id);
 
 /* 计算一个 segment 和 query 对应 segment 的 partial L2 距离 */
-float partial_l2(const float *x, const float *q);
+float partial_l2(const float *x, const float *q, uint32_t dim);
 
 /* 解析ivf_metadata.bin */
 int parse_ivf_meta(const char *filename, ivf_meta_t *meta);
@@ -408,9 +423,11 @@ const cluster_info_t *find_cluster_info(const ivf_meta_t *meta, uint32_t cluster
  *  - stage_worker_counts: 每个 stage 启用的 worker 数
  *  - stage_cores: 每个 stage 的 worker -> CPU core 映射
  *  - topk_core: top-k worker 绑定到哪个核
- *  - query_segs: query 的 4 个 segment
+ *  - read_depth: 每个 stage worker 的 in-flight read 深度
+ *  - stage1_gap_merge_limit: stage1 允许跨过的空 bundle 数量
+ *  - coarse_backend_name: coarse search 后端，brute 或 faiss
  *  - threshold: 提前终止阈值
- *  - ivf_meta_path: ivf_meta.bin 的路径
+ *  - ivf_meta_path: ivf_meta_flex.bin 的路径
  */
 int pipeline_init(
     pipeline_app_t *app,
@@ -418,7 +435,9 @@ int pipeline_init(
     const uint32_t stage_worker_counts[NUM_STAGES],
     const int stage_cores[NUM_STAGES][MAX_WORKERS_PER_STAGE],
     int topk_core,
-    float *query_segs[NUM_STAGES],
+    uint32_t read_depth,
+    uint32_t stage1_gap_merge_limit,
+    const char *coarse_backend_name,
     float threshold,
     const char *ivf_meta_path,
     const char *sorted_ids_path
@@ -465,11 +484,11 @@ void pipeline_destroy(pipeline_app_t *app);
 
  
  
-int load_centroids_bin(const char *path, uint32_t *nlist_out, float **centroids_out);
 int load_sorted_ids_bin(const char *path, uint32_t *num_vectors_out, uint32_t **sorted_ids_out);
 
 int coarse_search_topn(const float *query,
                        const float *centroids,
+                       uint32_t dim,
                        uint32_t nlist,
                        uint32_t nprobe,
                        coarse_hit_t *out_hits);
