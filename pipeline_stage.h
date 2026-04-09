@@ -353,6 +353,9 @@ typedef struct pipeline_app {
     /* stage1 允许跨过的空 bundle 数量 */
     uint32_t stage1_gap_merge_limit;
 
+    /* 实际启用多少个 stage；最后一个 active stage 之后直接进入 top-k */
+    uint32_t active_stages;
+
     /* coarse search backend */
     coarse_backend_t coarse_backend;
 
@@ -453,6 +456,7 @@ int pipeline_init(
     int topk_core,
     uint32_t read_depth,
     uint32_t stage1_gap_merge_limit,
+    uint32_t active_stages,
     const char *coarse_backend_name,
     const char *prune_threshold_mode_name,
     float threshold,

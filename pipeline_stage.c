@@ -814,7 +814,7 @@ static void forward_batch(pipeline_app_t *app, batch_t *b) {
     }
     
     // 防一下非法stage的出现
-    if (b->stage >= NUM_STAGES) {
+    if (b->stage >= app->active_stages) {
         fprintf(stderr, "[forward_batch] invalid next stage=%u\n", b->stage);
         free(b);
         return;
@@ -822,6 +822,64 @@ static void forward_batch(pipeline_app_t *app, batch_t *b) {
 
     int lane = pick_lane_rr(app, b->stage);
     queue_push(&app->workers[b->stage][lane].inq, b);
+}
+
+static batch_t *alloc_stage_out_batch(uint64_t qid, uint8_t stage)
+{
+    batch_t *out = (batch_t *)calloc(1, sizeof(*out));
+    if (!out) {
+        perror("calloc out batch");
+        exit(1);
+    }
+    out->magic = MAGIC_BATCH;
+    out->qid = qid;
+    out->stage = stage;
+    return out;
+}
+
+static void emit_out_batch(pipeline_app_t *app,
+                           batch_t *out,
+                           uint32_t *child_batches)
+{
+    if (!app || !out || out->count == 0) {
+        return;
+    }
+
+    if (out->stage >= app->active_stages) {
+        queue_push(&app->topk.inq, out);
+    } else {
+        forward_batch(app, out);
+    }
+
+    if (child_batches) {
+        (*child_batches)++;
+    }
+}
+
+static batch_t *append_bundle_group_to_out(pipeline_app_t *app,
+                                           batch_t *out,
+                                           const cand_item_t *bundle_items,
+                                           uint16_t bundle_count,
+                                           uint32_t *child_batches)
+{
+    if (!out || !bundle_items || bundle_count == 0) {
+        return out;
+    }
+
+    if (out->count > 0 && out->count + bundle_count > MAX_BATCH) {
+        emit_out_batch(app, out, child_batches);
+        out = alloc_stage_out_batch(out->qid, out->stage);
+    }
+
+    if (bundle_count > MAX_BATCH) {
+        fprintf(stderr, "append_bundle_group_to_out: bundle_count=%u exceeds MAX_BATCH=%u\n",
+                bundle_count, MAX_BATCH);
+        abort();
+    }
+
+    memcpy(&out->items[out->count], bundle_items, (size_t)bundle_count * sizeof(bundle_items[0]));
+    out->count += bundle_count;
+    return out;
 }
 
 /* ============================================================
@@ -975,15 +1033,7 @@ static void *stage_worker_main(void *arg) {
         /*
          * 申请out，它是要发给下一个stage的新batch
          */
-        batch_t *out = calloc(1, sizeof(*out));
-        if (!out) {
-            perror("calloc out batch");
-            exit(1);
-        }
-
-        out->magic = MAGIC_BATCH;
-        out->qid = in->qid;
-        out->stage = in->stage + 1;
+        batch_t *out = alloc_stage_out_batch(in->qid, in->stage + 1);
 
         // 从query_tracker_t里面读出query和该query的动态阈值
         const float *query_seg = NULL;
@@ -1019,6 +1069,10 @@ static void *stage_worker_main(void *arg) {
         uint32_t batch_bundles_read = 0;
         uint32_t batch_nvme_reads = 0;
         uint64_t batch_nvme_read_bytes = 0;
+        cand_item_t bundle_items[MAX_BATCH];
+        uint16_t bundle_item_count = 0;
+        uint32_t current_bundle_cluster = UINT32_MAX;
+        uint32_t current_bundle_idx = UINT32_MAX;
 
         if (in->count > 1) {
             uint64_t qsort_begin_us = now_us();
@@ -1106,49 +1160,18 @@ static void *stage_worker_main(void *arg) {
                         }
                         batch_out++;
 
-                        if (w->stage_id == NUM_STAGES - 1) {
-                            out->items[out->count].vec_id = vec_id;
-                            out->items[out->count].cluster_id = cluster_id;
-                            out->items[out->count].local_idx = local_idx;
-                            out->items[out->count].partial_sum = acc;
-                            out->count++;
-
-                            if (out->count == MAX_BATCH) {
-                                queue_push(&app->topk.inq, out);
-                                child_batches++;
-
-                                out = calloc(1, sizeof(*out));
-                                if (!out) {
-                                    perror("calloc final spill batch");
-                                    exit(1);
-                                }
-
-                                out->magic = MAGIC_BATCH;
-                                out->qid = in->qid;
-                                out->stage = NUM_STAGES;
-                            }
-                        } else {
-                            out->items[out->count].vec_id = vec_id;
-                            out->items[out->count].cluster_id = cluster_id;
-                            out->items[out->count].local_idx = local_idx;
-                            out->items[out->count].partial_sum = acc;
-                            out->count++;
-
-                            if (out->count == MAX_BATCH) {
-                                forward_batch(app, out);
-                                child_batches++;
-
-                                out = calloc(1, sizeof(*out));
-                                if (!out) {
-                                    perror("calloc spill batch");
-                                    exit(1);
-                                }
-
-                                out->magic = MAGIC_BATCH;
-                                out->qid = in->qid;
-                                out->stage = in->stage + 1;
-                            }
+                        if (current_bundle_cluster != cluster_id || current_bundle_idx != bundle_idx) {
+                            out = append_bundle_group_to_out(app, out, bundle_items, bundle_item_count, &child_batches);
+                            bundle_item_count = 0;
+                            current_bundle_cluster = cluster_id;
+                            current_bundle_idx = bundle_idx;
                         }
+
+                        bundle_items[bundle_item_count].vec_id = vec_id;
+                        bundle_items[bundle_item_count].cluster_id = cluster_id;
+                        bundle_items[bundle_item_count].local_idx = local_idx;
+                        bundle_items[bundle_item_count].partial_sum = acc;
+                        bundle_item_count++;
                     }
                 }
 
@@ -1180,18 +1203,17 @@ static void *stage_worker_main(void *arg) {
         }
 
         /* 扫完输入 batch 后，把剩余 surviving batch 发出去 */
+        out = append_bundle_group_to_out(app, out, bundle_items, bundle_item_count, &child_batches);
 
         if (w->stage_id != NUM_STAGES - 1) {
             if (out->count > 0) {
-                forward_batch(app, out);
-                child_batches++;
+                emit_out_batch(app, out, &child_batches);
             } else {
                 free(out);
             }
         } else {
             if (out->count > 0) {
-                queue_push(&app->topk.inq, out);
-                child_batches++;
+                emit_out_batch(app, out, &child_batches);
             } else {
                 free(out);
             }
@@ -1257,6 +1279,7 @@ int pipeline_init(
     int topk_core,
     uint32_t read_depth,
     uint32_t stage1_gap_merge_limit,
+    uint32_t active_stages,
     const char *coarse_backend_name_arg,
     const char *prune_threshold_mode_name_arg,
     float threshold,
@@ -1276,6 +1299,13 @@ int pipeline_init(
                 MAX_BATCH);
         return -1;
     }
+    if (active_stages == 0 || active_stages > NUM_STAGES) {
+        fprintf(stderr,
+                "pipeline_init: invalid active stages=%u valid_range=[1,%d]\n",
+                active_stages,
+                NUM_STAGES);
+        return -1;
+    }
     if (backend != COARSE_BACKEND_BRUTE && backend != COARSE_BACKEND_FAISS) {
         fprintf(stderr,
                 "pipeline_init: invalid coarse backend '%s' (expected brute or faiss)\n",
@@ -1290,9 +1320,10 @@ int pipeline_init(
     }
 
     fprintf(stderr,
-            "[pipeline_init] begin read_depth=%u stage1_gap_merge_limit=%u coarse_backend=%s prune_threshold_mode=%s ivf_meta=%s sorted_ids=%s\n",
+            "[pipeline_init] begin read_depth=%u stage1_gap_merge_limit=%u active_stages=%u coarse_backend=%s prune_threshold_mode=%s ivf_meta=%s sorted_ids=%s\n",
             read_depth,
             stage1_gap_merge_limit,
+            active_stages,
             coarse_backend_name(backend),
             prune_threshold_mode_name(prune_mode),
             ivf_meta_path ? ivf_meta_path : "(null)",
@@ -1311,6 +1342,7 @@ int pipeline_init(
     app->threshold = threshold;
     app->read_depth = read_depth;
     app->stage1_gap_merge_limit = stage1_gap_merge_limit;
+    app->active_stages = active_stages;
     app->coarse_backend = backend;
     app->prune_threshold_mode = prune_mode;
 
@@ -1485,7 +1517,7 @@ int pipeline_init(
 void pipeline_start(pipeline_app_t *app) {
     pthread_create(&app->topk.tid, NULL, topk_thread_main, &app->topk);
 
-    for (int s = 0; s < NUM_STAGES; s++) {
+    for (uint32_t s = 0; s < app->active_stages; s++) {
         for (uint32_t lane = 0; lane < app->stage_worker_counts[s]; lane++) {
             pthread_create(&app->workers[s][lane].tid, NULL,
                            stage_worker_main, &app->workers[s][lane]);
@@ -1517,7 +1549,7 @@ void pipeline_submit_initial_batch(pipeline_app_t *app, batch_t *b) {
  * ============================================================ */
 
 void pipeline_stop(pipeline_app_t *app) {
-    for (int s = 0; s < NUM_STAGES; s++) {
+    for (uint32_t s = 0; s < app->active_stages; s++) {
         for (uint32_t lane = 0; lane < app->stage_worker_counts[s]; lane++) {
             queue_close(&app->workers[s][lane].inq);
         }
@@ -1530,7 +1562,7 @@ void pipeline_stop(pipeline_app_t *app) {
 
 void pipeline_join(pipeline_app_t *app) {
     /* 1. 先等所有 stage worker 退出 */
-    for (int s = 0; s < NUM_STAGES; s++) {
+    for (uint32_t s = 0; s < app->active_stages; s++) {
         for (uint32_t lane = 0; lane < app->stage_worker_counts[s]; lane++) {
             pthread_join(app->workers[s][lane].tid, NULL);
         }

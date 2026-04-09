@@ -22,6 +22,7 @@ typedef struct {
     uint32_t nprobe;
     uint32_t read_depth;
     uint32_t stage1_gap_merge_limit;
+    uint32_t active_stages;
     const char *coarse_backend;
     const char *prune_threshold_mode;
     const char *iova_mode;
@@ -64,6 +65,7 @@ static void init_runtime_options(runtime_options_t *opts)
     opts->nprobe = 32;
     opts->read_depth = 8;
     opts->stage1_gap_merge_limit = 1;
+    opts->active_stages = NUM_STAGES;
     opts->coarse_backend = "faiss";
     opts->prune_threshold_mode = "sampled";
     opts->iova_mode = NULL;
@@ -83,6 +85,7 @@ static int parse_runtime_options(int argc, char **argv, runtime_options_t *opts)
         {"nprobe", required_argument, 0, 'n'},
         {"read-depth", required_argument, 0, 'r'},
         {"stage1-gap-merge", required_argument, 0, 'g'},
+        {"active-stages", required_argument, 0, 'a'},
         {"coarse-backend", required_argument, 0, 'c'},
         {"prune-threshold-mode", required_argument, 0, 't'},
         {"iova-mode", required_argument, 0, 'i'},
@@ -107,6 +110,9 @@ static int parse_runtime_options(int argc, char **argv, runtime_options_t *opts)
             case 'g':
                 opts->stage1_gap_merge_limit = (uint32_t)strtoul(optarg, NULL, 10);
                 break;
+            case 'a':
+                opts->active_stages = (uint32_t)strtoul(optarg, NULL, 10);
+                break;
             case 'c':
                 opts->coarse_backend = optarg;
                 break;
@@ -124,7 +130,7 @@ static int parse_runtime_options(int argc, char **argv, runtime_options_t *opts)
                 break;
             default:
                 fprintf(stderr,
-                        "Usage: %s [--max-queries N] [--nprobe N] [--read-depth N] [--stage1-gap-merge N] [--coarse-backend brute|faiss] [--prune-threshold-mode centroid|sampled] [--iova-mode pa|va] [--print-per-query] [--summary-only]\n",
+                        "Usage: %s [--max-queries N] [--nprobe N] [--read-depth N] [--stage1-gap-merge N] [--active-stages N] [--coarse-backend brute|faiss] [--prune-threshold-mode centroid|sampled] [--iova-mode pa|va] [--print-per-query] [--summary-only]\n",
                         argv[0]);
                 return -1;
         }
@@ -140,6 +146,10 @@ static int parse_runtime_options(int argc, char **argv, runtime_options_t *opts)
     }
     if (opts->stage1_gap_merge_limit > MAX_BATCH) {
         fprintf(stderr, "parse_runtime_options: stage1-gap-merge must be in [0, %d]\n", MAX_BATCH);
+        return -1;
+    }
+    if (opts->active_stages == 0 || opts->active_stages > NUM_STAGES) {
+        fprintf(stderr, "parse_runtime_options: active-stages must be in [1, %d]\n", NUM_STAGES);
         return -1;
     }
     if (strcmp(opts->coarse_backend, "brute") != 0 &&
@@ -670,6 +680,7 @@ int main(int argc, char **argv)
     pipeline_app_t app;
     if (pipeline_init(&app, disks, stage_worker_counts, stage_cores, topk_core,
                       runtime_opts.read_depth, runtime_opts.stage1_gap_merge_limit,
+                      runtime_opts.active_stages,
                       runtime_opts.coarse_backend, runtime_opts.prune_threshold_mode,
                       threshold, ivf_meta_path, sorted_ids_path) != 0) {
         fprintf(stderr, "pipeline_init failed\n");
