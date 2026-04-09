@@ -57,7 +57,7 @@ typedef enum {
 #define MAX_QUERIES_IN_FLIGHT 1024
 
 // prune阈值相关参数
-#define PRUNE_SAMPLE_TOPK 5
+#define PRUNE_SAMPLE_TOPK 10
 #define PRUNE_SAMPLE_SIZE 10000
 
 /* -----------------------------

@@ -275,7 +275,7 @@ static float compute_centroid_prune_threshold(const coarse_hit_t *hits,
 
     float threshold = hits[threshold_rank - 1].dist;
     if (!(threshold > 0.0f) || !isfinite(threshold)) {
-        return fallback_threshold;
+        threshold = fallback_threshold;
     }
 
     return threshold;
@@ -1962,13 +1962,13 @@ int submit_query(pipeline_app_t *app,
         }
     }
 
-    printf("[submit_query] qid=%lu nprobe=%u prune_mode=%s prune_threshold=%f sample_count=%u sample_topk=%u\n",
-           qid,
-           nprobe,
-           prune_threshold_mode_name(app->prune_threshold_mode),
-           qt->prune_threshold,
-           app->prune_sample_count,
-           PRUNE_SAMPLE_TOPK);
+    // printf("[submit_query] qid=%lu nprobe=%u prune_mode=%s prune_threshold=%f sample_count=%u sample_topk=%u\n",
+    //        qid,
+    //        nprobe,
+    //        prune_threshold_mode_name(app->prune_threshold_mode),
+    //        qt->prune_threshold,
+    //        app->prune_sample_count,
+    //        PRUNE_SAMPLE_TOPK);
 
     /* 4) 依次提交每个命中 cluster 的 candidates */
     uint64_t submit_begin_us = now_us();
