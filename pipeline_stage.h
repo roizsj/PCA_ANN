@@ -26,6 +26,11 @@ typedef enum {
     COARSE_BACKEND_FAISS = 1,
 } coarse_backend_t;
 
+typedef enum {
+    PRUNE_THRESHOLD_CENTROID = 0,
+    PRUNE_THRESHOLD_SAMPLED = 1,
+} prune_threshold_mode_t;
+
 /* -----------------------------
  * 全局常量
  * ----------------------------- */
@@ -34,7 +39,7 @@ typedef enum {
 #define NUM_STAGES 4
 
 /* 每个 stage 最多绑定多少个 worker / CPU 核 */
-#define MAX_WORKERS_PER_STAGE 6
+#define MAX_WORKERS_PER_STAGE 12
 
 /* 单个 batch 最多容纳多少个 candidate */
 #define MAX_BATCH 256
@@ -50,6 +55,10 @@ typedef enum {
 #define IVF_META_MAGIC_FLEX 0x49564634u
 
 #define MAX_QUERIES_IN_FLIGHT 1024
+
+// prune阈值相关参数
+#define PRUNE_SAMPLE_TOPK 5
+#define PRUNE_SAMPLE_SIZE 10000
 
 /* -----------------------------
  * cluster metadata 数据结构
@@ -294,6 +303,8 @@ typedef struct {
     uint64_t stage_pruned[NUM_STAGES];
     uint64_t stage_batches[NUM_STAGES];
     uint64_t stage_bundles_read[NUM_STAGES];
+    uint64_t stage_nvme_reads[NUM_STAGES];
+    uint64_t stage_nvme_read_bytes[NUM_STAGES];
     uint64_t stage_wall_us[NUM_STAGES];
     uint64_t stage_io_us[NUM_STAGES];
     uint64_t stage_qsort_us[NUM_STAGES];
@@ -345,6 +356,9 @@ typedef struct pipeline_app {
     /* coarse search backend */
     coarse_backend_t coarse_backend;
 
+    /* prune threshold mode */
+    prune_threshold_mode_t prune_threshold_mode;
+
     /* 一些简单统计 */
     uint64_t stage_in[NUM_STAGES];
     uint64_t stage_out[NUM_STAGES];
@@ -362,6 +376,8 @@ typedef struct pipeline_app {
     coarse_search_module_t *coarse_module;
     uint32_t *sorted_vec_ids;
     uint32_t num_sorted_vec_ids;
+    float *prune_sample_vectors;      /* [prune_sample_count * dim] */
+    uint32_t prune_sample_count;
 
     /* query 跟踪表 */
     query_tracker_t queries[MAX_QUERIES_IN_FLIGHT];
@@ -438,6 +454,7 @@ int pipeline_init(
     uint32_t read_depth,
     uint32_t stage1_gap_merge_limit,
     const char *coarse_backend_name,
+    const char *prune_threshold_mode_name,
     float threshold,
     const char *ivf_meta_path,
     const char *sorted_ids_path

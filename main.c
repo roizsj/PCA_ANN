@@ -23,6 +23,7 @@ typedef struct {
     uint32_t read_depth;
     uint32_t stage1_gap_merge_limit;
     const char *coarse_backend;
+    const char *prune_threshold_mode;
     const char *iova_mode;
     bool print_per_query;
 } runtime_options_t;
@@ -40,6 +41,8 @@ typedef struct {
     uint64_t stage_pruned_sum[NUM_STAGES];
     uint64_t stage_batches_sum[NUM_STAGES];
     uint64_t stage_bundles_sum[NUM_STAGES];
+    uint64_t stage_nvme_reads_sum[NUM_STAGES];
+    uint64_t stage_nvme_read_bytes_sum[NUM_STAGES];
     uint64_t stage_wall_us_sum[NUM_STAGES];
     uint64_t stage_io_us_sum[NUM_STAGES];
     uint64_t stage_qsort_us_sum[NUM_STAGES];
@@ -62,6 +65,7 @@ static void init_runtime_options(runtime_options_t *opts)
     opts->read_depth = 8;
     opts->stage1_gap_merge_limit = 1;
     opts->coarse_backend = "faiss";
+    opts->prune_threshold_mode = "sampled";
     opts->iova_mode = NULL;
     opts->print_per_query = false;
 }
@@ -80,6 +84,7 @@ static int parse_runtime_options(int argc, char **argv, runtime_options_t *opts)
         {"read-depth", required_argument, 0, 'r'},
         {"stage1-gap-merge", required_argument, 0, 'g'},
         {"coarse-backend", required_argument, 0, 'c'},
+        {"prune-threshold-mode", required_argument, 0, 't'},
         {"iova-mode", required_argument, 0, 'i'},
         {"print-per-query", no_argument, 0, 'p'},
         {"summary-only", no_argument, 0, 's'},
@@ -105,6 +110,9 @@ static int parse_runtime_options(int argc, char **argv, runtime_options_t *opts)
             case 'c':
                 opts->coarse_backend = optarg;
                 break;
+            case 't':
+                opts->prune_threshold_mode = optarg;
+                break;
             case 'i':
                 opts->iova_mode = optarg;
                 break;
@@ -116,7 +124,7 @@ static int parse_runtime_options(int argc, char **argv, runtime_options_t *opts)
                 break;
             default:
                 fprintf(stderr,
-                        "Usage: %s [--max-queries N] [--nprobe N] [--read-depth N] [--stage1-gap-merge N] [--coarse-backend brute|faiss] [--iova-mode pa|va] [--print-per-query] [--summary-only]\n",
+                        "Usage: %s [--max-queries N] [--nprobe N] [--read-depth N] [--stage1-gap-merge N] [--coarse-backend brute|faiss] [--prune-threshold-mode centroid|sampled] [--iova-mode pa|va] [--print-per-query] [--summary-only]\n",
                         argv[0]);
                 return -1;
         }
@@ -139,6 +147,13 @@ static int parse_runtime_options(int argc, char **argv, runtime_options_t *opts)
         fprintf(stderr,
                 "parse_runtime_options: coarse-backend must be 'brute' or 'faiss' (got=%s)\n",
                 opts->coarse_backend);
+        return -1;
+    }
+    if (strcmp(opts->prune_threshold_mode, "centroid") != 0 &&
+        strcmp(opts->prune_threshold_mode, "sampled") != 0) {
+        fprintf(stderr,
+                "parse_runtime_options: prune-threshold-mode must be 'centroid' or 'sampled' (got=%s)\n",
+                opts->prune_threshold_mode);
         return -1;
     }
     if (opts->iova_mode &&
@@ -326,16 +341,24 @@ static void print_query_report(const pipeline_app_t *app, uint64_t qid, uint32_t
             }
             double avg_batch_ms = 0.0;
             double avg_bundle_us = 0.0;
+            double avg_read_bytes = 0.0;
+            double avg_bundles_per_nvme_read = 0.0;
             if (qt->stage_batches[s] > 0) {
                 avg_batch_ms = wall_ms / (double)qt->stage_batches[s];
             }
             if (qt->stage_bundles_read[s] > 0) {
                 avg_bundle_us = (double)qt->stage_io_us[s] / (double)qt->stage_bundles_read[s];
             }
+            if (qt->stage_nvme_reads[s] > 0) {
+                avg_read_bytes = (double)qt->stage_nvme_read_bytes[s] / (double)qt->stage_nvme_reads[s];
+                avg_bundles_per_nvme_read =
+                    (double)qt->stage_bundles_read[s] / (double)qt->stage_nvme_reads[s];
+            }
             if (qt->stage_in[s] > 0) {
                 prune_ratio = 1.0 - (double)qt->stage_out[s] / (double)qt->stage_in[s];
             }
             printf("  stage%d in=%lu out=%lu pruned=%lu batches=%lu bundles=%lu "
+                "nvme_reads=%lu avg_read_bytes=%.1f avg_bundles_per_nvme_read=%.3f "
                 "prune_ratio=%.4f wall_ms=%.3f io_ms=%.3f qsort_ms=%.3f "
                 "est_compute_ms=%.3f avg_batch_ms=%.3f avg_io_per_bundle_us=%.3f\n",
                 s,
@@ -344,6 +367,9 @@ static void print_query_report(const pipeline_app_t *app, uint64_t qid, uint32_t
                 qt->stage_pruned[s],
                 qt->stage_batches[s],
                 qt->stage_bundles_read[s],
+                qt->stage_nvme_reads[s],
+                avg_read_bytes,
+                avg_bundles_per_nvme_read,
                 prune_ratio,
                 wall_ms,
                 io_ms,
@@ -427,6 +453,8 @@ static void accumulate_query_summary(run_summary_t *sum, const query_tracker_t *
         sum->stage_pruned_sum[s] += qt->stage_pruned[s];
         sum->stage_batches_sum[s] += qt->stage_batches[s];
         sum->stage_bundles_sum[s] += qt->stage_bundles_read[s];
+        sum->stage_nvme_reads_sum[s] += qt->stage_nvme_reads[s];
+        sum->stage_nvme_read_bytes_sum[s] += qt->stage_nvme_read_bytes[s];
         sum->stage_wall_us_sum[s] += qt->stage_wall_us[s];
         sum->stage_io_us_sum[s] += qt->stage_io_us[s];
         sum->stage_qsort_us_sum[s] += qt->stage_qsort_us[s];
@@ -461,16 +489,28 @@ static void print_run_summary(const run_summary_t *sum, uint32_t nprobe, uint64_
         double avg_io_ms = (double)sum->stage_io_us_sum[s] / 1000.0 / (double)sum->queries;
         double avg_qsort_ms = (double)sum->stage_qsort_us_sum[s] / 1000.0 / (double)sum->queries;
         double avg_compute_ms = avg_wall_ms - avg_io_ms - avg_qsort_ms;
+        double avg_nvme_reads = (double)sum->stage_nvme_reads_sum[s] / (double)sum->queries;
+        double avg_read_bytes = 0.0;
+        double avg_bundles_per_nvme_read = 0.0;
         if (avg_compute_ms < 0.0) {
             avg_compute_ms = 0.0;
         }
-        printf("  stage%d avg_in=%.1f avg_out=%.1f avg_pruned=%.1f avg_batches=%.1f avg_bundles=%.1f avg_wall_ms=%.3f avg_io_ms=%.3f avg_qsort_ms=%.3f avg_est_compute_ms=%.3f\n",
+        if (sum->stage_nvme_reads_sum[s] > 0) {
+            avg_read_bytes = (double)sum->stage_nvme_read_bytes_sum[s] /
+                             (double)sum->stage_nvme_reads_sum[s];
+            avg_bundles_per_nvme_read = (double)sum->stage_bundles_sum[s] /
+                                        (double)sum->stage_nvme_reads_sum[s];
+        }
+        printf("  stage%d avg_in=%.1f avg_out=%.1f avg_pruned=%.1f avg_batches=%.1f avg_bundles=%.1f avg_nvme_reads=%.1f avg_read_bytes=%.1f avg_bundles_per_nvme_read=%.3f avg_wall_ms=%.3f avg_io_ms=%.3f avg_qsort_ms=%.3f avg_est_compute_ms=%.3f\n",
                s,
                (double)sum->stage_in_sum[s] / (double)sum->queries,
                (double)sum->stage_out_sum[s] / (double)sum->queries,
                (double)sum->stage_pruned_sum[s] / (double)sum->queries,
                (double)sum->stage_batches_sum[s] / (double)sum->queries,
                (double)sum->stage_bundles_sum[s] / (double)sum->queries,
+               avg_nvme_reads,
+               avg_read_bytes,
+               avg_bundles_per_nvme_read,
                avg_wall_ms,
                avg_io_ms,
                avg_qsort_ms,
@@ -598,17 +638,17 @@ int main(int argc, char **argv)
 
     /* 3. core 配置 */
     // TODO 如果后面要改每个stage的核数，就改这一行
-    const uint32_t stage_worker_counts[NUM_STAGES] = {6, 4, 4, 4};
+    const uint32_t stage_worker_counts[NUM_STAGES] = {4, 4, 4, 4};
     const int stage_cores[NUM_STAGES][MAX_WORKERS_PER_STAGE] = {
-        {1, 5, 9, 13, 17, 21},
-        {2, 6, 10, 14, 18, 22},
-        {3, 7, 11, 15, 19, 23},
-        {4, 8, 12, 16, 20, 24}
+        {1, 5, 9, 13, 17, 19, 21, 23},
+        {2, 6, 10, 14, 18, 20, 22, 24},
+        {3, 7, 11, 15},
+        {4, 8, 12, 16}
     };
     int topk_core = 25;
 
     /* 4. query 相关与输入参数配置 */
-    float threshold = 80000.0f; // fallback 阈值；正常情况下会被每个 query 的动态阈值覆盖
+    float threshold = 1000000.0f; // fallback 阈值；正常情况下会被每个 query 的动态阈值覆盖
     const char *ivf_meta_path = 
         "/home/zhangshujie/ann_ssd/pca_ann/preprocessing/gist1m_output/ivf_meta.bin"; // ivf_meta_flex 的路径
     const char *query_fvecs_path =
@@ -630,7 +670,7 @@ int main(int argc, char **argv)
     pipeline_app_t app;
     if (pipeline_init(&app, disks, stage_worker_counts, stage_cores, topk_core,
                       runtime_opts.read_depth, runtime_opts.stage1_gap_merge_limit,
-                      runtime_opts.coarse_backend,
+                      runtime_opts.coarse_backend, runtime_opts.prune_threshold_mode,
                       threshold, ivf_meta_path, sorted_ids_path) != 0) {
         fprintf(stderr, "pipeline_init failed\n");
         return 1;

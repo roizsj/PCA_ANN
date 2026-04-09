@@ -12,10 +12,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define DIM 128
 #define NUM_SHARDS 1
-#define SHARD_DIM DIM
-#define SHARD_BYTES (SHARD_DIM * sizeof(float))   // 512B
 #define MAGIC_META 0x49564633u                    // "IVF3"
 
 typedef struct {
@@ -40,7 +37,6 @@ typedef struct {
     uint64_t start_lba;     // cluster 从哪个 LBA 开始
     uint32_t num_vectors;   // cluster 实际向量数
     uint32_t num_lbas;      // ceil(num_vectors / vectors_per_lba)
-    float centroid[DIM];
 } ClusterMeta;
 
 typedef struct {
@@ -124,19 +120,19 @@ static FvecsData read_fvecs(const char *path) {
     if (fread(&dim, sizeof(int32_t), 1, fp) != 1) {
         die_msg("failed to read fvecs dim");
     }
-    if (dim != DIM) {
-        fprintf(stderr, "fvecs dim mismatch: got %d expected %d\n", dim, DIM);
+    if (dim <= 0) {
+        fprintf(stderr, "invalid fvecs dim: %d\n", dim);
         exit(EXIT_FAILURE);
     }
 
-    const long row_bytes = sizeof(int32_t) + DIM * (long)sizeof(float);
+    const long row_bytes = sizeof(int32_t) + (long)dim * (long)sizeof(float);
     if (file_sz % row_bytes != 0) {
         fprintf(stderr, "invalid fvecs file size: %ld\n", file_sz);
         exit(EXIT_FAILURE);
     }
 
     uint32_t n = (uint32_t)(file_sz / row_bytes);
-    float *data = (float *)xmalloc((size_t)n * DIM * sizeof(float));
+    float *data = (float *)xmalloc((size_t)n * (size_t)dim * sizeof(float));
 
     rewind(fp);
     for (uint32_t i = 0; i < n; i++) {
@@ -144,11 +140,11 @@ static FvecsData read_fvecs(const char *path) {
         if (fread(&row_dim, sizeof(int32_t), 1, fp) != 1) {
             die_msg("failed to read row dim");
         }
-        if (row_dim != DIM) {
-            fprintf(stderr, "row %u dim mismatch: got %d expected %d\n", i, row_dim, DIM);
+        if (row_dim != dim) {
+            fprintf(stderr, "row %u dim mismatch: got %d expected %d\n", i, row_dim, dim);
             exit(EXIT_FAILURE);
         }
-        if (fread(data + (size_t)i * DIM, sizeof(float), DIM, fp) != DIM) {
+        if (fread(data + (size_t)i * (size_t)dim, sizeof(float), (size_t)dim, fp) != (size_t)dim) {
             die_msg("failed to read row vector");
         }
     }
@@ -157,7 +153,7 @@ static FvecsData read_fvecs(const char *path) {
 
     FvecsData out = {
         .n = n,
-        .d = DIM,
+        .d = (uint32_t)dim,
         .data = data
     };
     return out;
@@ -167,7 +163,7 @@ static FvecsData read_fvecs(const char *path) {
  * centroids.bin:
  * [u32 nlist][u32 dim][float centroids[nlist * dim]]
  */
-static CentroidData read_centroids_bin(const char *path) {
+static CentroidData read_centroids_bin(const char *path, uint32_t expected_dim) {
     FILE *fp = fopen(path, "rb");
     if (!fp) die("fopen centroids");
 
@@ -175,13 +171,14 @@ static CentroidData read_centroids_bin(const char *path) {
     if (fread(&nlist, sizeof(uint32_t), 1, fp) != 1) die_msg("read nlist failed");
     if (fread(&d, sizeof(uint32_t), 1, fp) != 1) die_msg("read dim failed");
 
-    if (d != DIM) {
-        fprintf(stderr, "centroid dim mismatch: got %u expected %d\n", d, DIM);
+    if (d != expected_dim) {
+        fprintf(stderr, "centroid dim mismatch: got %u expected %u\n", d, expected_dim);
         exit(EXIT_FAILURE);
     }
 
-    float *centroids = (float *)xmalloc((size_t)nlist * DIM * sizeof(float));
-    if (fread(centroids, sizeof(float), (size_t)nlist * DIM, fp) != (size_t)nlist * DIM) {
+    float *centroids = (float *)xmalloc((size_t)nlist * (size_t)expected_dim * sizeof(float));
+    if (fread(centroids, sizeof(float), (size_t)nlist * (size_t)expected_dim, fp) !=
+        (size_t)nlist * (size_t)expected_dim) {
         die_msg("read centroids body failed");
     }
 
@@ -337,12 +334,14 @@ static void cleanup_spdk(AppState *app) {
 }
 
 static void save_meta_file(const char *path,
+                           uint32_t dim,
                            uint32_t nlist,
                            uint32_t num_vectors,
                            uint32_t sector_size,
                            uint32_t vectors_per_lba,
                            uint64_t base_lba,
-                           const ClusterMeta *cluster_meta) {
+                           const ClusterMeta *cluster_meta,
+                           const float *centroids) {
     FILE *fp = fopen(path, "wb");
     if (!fp) die("fopen meta out");
 
@@ -350,8 +349,8 @@ static void save_meta_file(const char *path,
     memset(&hdr, 0, sizeof(hdr));
     hdr.magic = MAGIC_META;
     hdr.version = 1;
-    hdr.dim = DIM;
-    hdr.shard_dim = SHARD_DIM;
+    hdr.dim = dim;
+    hdr.shard_dim = dim;
     hdr.vectors_per_lba = vectors_per_lba;
     hdr.nlist = nlist;
     hdr.num_vectors = num_vectors;
@@ -359,7 +358,13 @@ static void save_meta_file(const char *path,
     hdr.base_lba = base_lba;
 
     fwrite(&hdr, sizeof(hdr), 1, fp);
-    fwrite(cluster_meta, sizeof(ClusterMeta), nlist, fp);
+    for (uint32_t i = 0; i < nlist; i++) {
+        fwrite(&cluster_meta[i].cluster_id, sizeof(cluster_meta[i].cluster_id), 1, fp);
+        fwrite(&cluster_meta[i].start_lba, sizeof(cluster_meta[i].start_lba), 1, fp);
+        fwrite(&cluster_meta[i].num_vectors, sizeof(cluster_meta[i].num_vectors), 1, fp);
+        fwrite(&cluster_meta[i].num_lbas, sizeof(cluster_meta[i].num_lbas), 1, fp);
+        fwrite(centroids + (size_t)i * (size_t)dim, sizeof(float), dim, fp);
+    }
     fclose(fp);
 }
 
@@ -428,21 +433,21 @@ int main(int argc, char **argv) {
     init_spdk_and_attach(&app);
 
     const uint32_t sector_size = app.disks[0].sector_size;
-    const uint32_t vectors_per_lba = sector_size / SHARD_BYTES; // 4096 / 512 = 8
+    FvecsData vecs = read_fvecs(app.cfg.input_fvecs);
+    const uint32_t shard_bytes = vecs.d * (uint32_t)sizeof(float);
+    const uint32_t vectors_per_lba = sector_size / shard_bytes;
     if (vectors_per_lba == 0) {
-        die_msg("vectors_per_lba computed as 0");
+        fprintf(stderr, "vectors_per_lba computed as 0: sector_size=%u vector_bytes=%u\n",
+                sector_size, shard_bytes);
+        exit(EXIT_FAILURE);
     }
 
     fprintf(stderr, "[info] sector_size=%u, vector_bytes=%u, vectors_per_lba=%u\n",
-            sector_size, (unsigned)SHARD_BYTES, vectors_per_lba);
+            sector_size, shard_bytes, vectors_per_lba);
 
-    FvecsData vecs = read_fvecs(app.cfg.input_fvecs);
-    CentroidData cents = read_centroids_bin(app.cfg.centroids_bin);
+    CentroidData cents = read_centroids_bin(app.cfg.centroids_bin, vecs.d);
     CodebookData codebook = read_codebook_bin(app.cfg.codebook_bin);
 
-    if (cents.d != DIM) {
-        die_msg("centroid dimension mismatch");
-    }
     if (codebook.n != vecs.n) {
         fprintf(stderr, "codebook size mismatch: codebook=%u vectors=%u\n",
                 codebook.n, vecs.n);
@@ -503,10 +508,6 @@ int main(int argc, char **argv) {
         cluster_meta[c].start_lba = cur_lba;
         cluster_meta[c].num_vectors = sz;
         cluster_meta[c].num_lbas = num_lbas;
-        memcpy(cluster_meta[c].centroid,
-               cents.centroids + (size_t)c * DIM,
-               DIM * sizeof(float));
-
         cur_lba += num_lbas;
     }
 
@@ -534,14 +535,14 @@ int main(int argc, char **argv) {
      * Step 5: 写盘
      *
      * 对每个 cluster:
-     *   每个 LBA bundle 最多打包 8 条完整向量
+     *   每个 LBA bundle 最多打包 vectors_per_lba 条完整向量
      *   单盘单 buffer
      *   lane k 对应 bundle 内第 k 条完整向量
      *
      * 布局：
      *   disk0, LBA x:
-     *     [vec0 full][vec1 full]...[vec7 full]
-     *     每条完整向量 512B
+     *     [vec0 full][vec1 full]...
+     *     每条完整向量 dim * 4B
      */
     for (uint32_t c = 0; c < cents.nlist; c++) {
         uint32_t num_vec = cluster_meta[c].num_vectors;
@@ -559,9 +560,9 @@ int main(int argc, char **argv) {
                 }
 
                 uint32_t vec_id = sorted_vec_ids[start_pos + local_idx];
-                const float *vec = vecs.data + (size_t)vec_id * DIM;
-                uint8_t *dst = dma_buf[0] + lane * SHARD_BYTES;
-                memcpy(dst, vec, SHARD_BYTES);
+                const float *vec = vecs.data + (size_t)vec_id * (size_t)vecs.d;
+                uint8_t *dst = dma_buf[0] + (size_t)lane * shard_bytes;
+                memcpy(dst, vec, shard_bytes);
             }
 
             uint64_t lba = start_lba + b;
@@ -611,12 +612,14 @@ int main(int argc, char **argv) {
      * Step 6: 保存 metadata
      */
     save_meta_file(app.cfg.meta_out,
+                   vecs.d,
                    cents.nlist,
                    vecs.n,
                    sector_size,
                    vectors_per_lba,
                    app.cfg.base_lba,
-                   cluster_meta);
+                   cluster_meta,
+                   cents.centroids);
 
     fprintf(stderr, "[done] metadata saved to %s\n", app.cfg.meta_out);
 

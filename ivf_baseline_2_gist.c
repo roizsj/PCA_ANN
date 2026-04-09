@@ -17,18 +17,17 @@
 #include <string.h>
 #include <time.h>
 
-#define DIM 128
 #define TOPK 10
 #define MAGIC_META 0x49564633u
 
-static const char *DEFAULT_META_PATH = "./preprocessing/ivf_output/ivf_meta_1_disk.bin";
-static const char *DEFAULT_SORTED_IDS_PATH = "./preprocessing/ivf_output/sorted_vec_ids_1_disk.bin";
-static const char *DEFAULT_QUERY_FVECS_PATH = "/home/zhangshujie/ann_nic/sift/sift_query.fvecs";
-static const char *DEFAULT_GT_IVECS_PATH = "/home/zhangshujie/ann_nic/sift/sift_groundtruth.ivecs";
-static const char *DEFAULT_PCA_MEAN_PATH = "./preprocessing/pca_output/pca_mean.bin";
-static const char *DEFAULT_PCA_COMPONENTS_PATH = "./preprocessing/pca_output/pca_components.bin";
-static const char *DEFAULT_PCA_EV_PATH = "./preprocessing/pca_output/pca_explained_variance.bin";
-static const char *DEFAULT_PCA_META_PATH = "./preprocessing/pca_output/pca_meta.bin";
+static const char *DEFAULT_META_PATH = "/home/zhangshujie/ann_ssd/pca_ann/preprocessing/gist1m_output/ivf_meta_1_disk.bin";
+static const char *DEFAULT_SORTED_IDS_PATH = "/home/zhangshujie/ann_ssd/pca_ann/preprocessing/gist1m_output/sorted_vec_ids_1_disk.bin";
+static const char *DEFAULT_QUERY_FVECS_PATH = "/home/zhangshujie/ann_nic/gist/gist_query.fvecs";
+static const char *DEFAULT_GT_IVECS_PATH = "/home/zhangshujie/ann_nic/gist/gist_groundtruth.ivecs";
+static const char *DEFAULT_PCA_MEAN_PATH = "/home/zhangshujie/ann_ssd/pca_ann/preprocessing/gist1m_output/gist_pca_mean.bin";
+static const char *DEFAULT_PCA_COMPONENTS_PATH = "/home/zhangshujie/ann_ssd/pca_ann/preprocessing/gist1m_output/gist_pca_components.bin";
+static const char *DEFAULT_PCA_EV_PATH = "/home/zhangshujie/ann_ssd/pca_ann/preprocessing/gist1m_output/gist_pca_explained_variance.bin";
+static const char *DEFAULT_PCA_META_PATH = "/home/zhangshujie/ann_ssd/pca_ann/preprocessing/gist1m_output/gist_pca_meta.bin";
 
 typedef struct {
     uint32_t magic;
@@ -47,7 +46,6 @@ typedef struct {
     uint64_t start_lba;
     uint32_t num_vectors;
     uint32_t num_lbas;
-    float centroid[DIM];
 } ClusterMetaOnDisk;
 
 typedef struct {
@@ -56,13 +54,14 @@ typedef struct {
     uint32_t num_vectors;
     uint32_t num_lbas;
     uint32_t sorted_id_base;
-    float centroid[DIM];
+    float *centroid;
 } ClusterInfo;
 
 typedef struct {
     MetaHeader header;
     ClusterInfo *clusters;
     uint32_t nlist;
+    float *centroids;
 } IvfMeta;
 
 typedef struct {
@@ -161,6 +160,8 @@ typedef struct {
     QueryDispatch *dispatch;
 } QueryWorker;
 
+static void free_ivf_meta(IvfMeta *meta);
+
 static inline uint64_t now_us(void)
 {
     struct timespec ts;
@@ -233,10 +234,10 @@ static void topk_finalize(TopkState *st)
     }
 }
 
-static float full_l2(const float *x, const float *q)
+static float full_l2(const float *x, const float *q, uint32_t dim)
 {
     float s = 0.0f;
-    for (uint32_t i = 0; i < DIM; i++) {
+    for (uint32_t i = 0; i < dim; i++) {
         float d = x[i] - q[i];
         s += d * d;
     }
@@ -397,9 +398,10 @@ static int parse_ivf_meta(const char *path, IvfMeta *meta)
         fclose(fp);
         return -1;
     }
-    if (meta->header.dim != DIM || meta->header.shard_dim != DIM) {
-        fprintf(stderr, "parse_ivf_meta: dim mismatch dim=%u shard_dim=%u expected=%u\n",
-                meta->header.dim, meta->header.shard_dim, DIM);
+    if (meta->header.dim == 0 || meta->header.shard_dim == 0 ||
+        meta->header.dim != meta->header.shard_dim) {
+        fprintf(stderr, "parse_ivf_meta: invalid dim layout dim=%u shard_dim=%u\n",
+                meta->header.dim, meta->header.shard_dim);
         fclose(fp);
         return -1;
     }
@@ -411,31 +413,49 @@ static int parse_ivf_meta(const char *path, IvfMeta *meta)
         fclose(fp);
         return -1;
     }
+    meta->centroids = (float *)calloc((size_t)meta->nlist * meta->header.dim, sizeof(*meta->centroids));
+    if (!meta->centroids) {
+        perror("calloc centroids");
+        free(meta->clusters);
+        meta->clusters = NULL;
+        fclose(fp);
+        return -1;
+    }
 
     uint32_t sorted_base = 0;
     for (uint32_t i = 0; i < meta->nlist; i++) {
         ClusterMetaOnDisk cm;
-        if (fread(&cm, sizeof(cm), 1, fp) != 1) {
+        if (fread(&cm.cluster_id, sizeof(cm.cluster_id), 1, fp) != 1 ||
+            fread(&cm.start_lba, sizeof(cm.start_lba), 1, fp) != 1 ||
+            fread(&cm.num_vectors, sizeof(cm.num_vectors), 1, fp) != 1 ||
+            fread(&cm.num_lbas, sizeof(cm.num_lbas), 1, fp) != 1) {
             fprintf(stderr, "parse_ivf_meta: failed to read cluster %u\n", i);
-            free(meta->clusters);
-            meta->clusters = NULL;
+            free_ivf_meta(meta);
             fclose(fp);
             return -1;
         }
         if (cm.cluster_id != i) {
             fprintf(stderr, "parse_ivf_meta: unsupported cluster id layout idx=%u cluster_id=%u\n",
                     i, cm.cluster_id);
-            free(meta->clusters);
-            meta->clusters = NULL;
+            free_ivf_meta(meta);
             fclose(fp);
             return -1;
         }
+
+        float *centroid = meta->centroids + (size_t)i * meta->header.dim;
+        if (fread(centroid, sizeof(float), meta->header.dim, fp) != meta->header.dim) {
+            fprintf(stderr, "parse_ivf_meta: failed to read centroid %u\n", i);
+            free_ivf_meta(meta);
+            fclose(fp);
+            return -1;
+        }
+
         meta->clusters[i].cluster_id = cm.cluster_id;
         meta->clusters[i].start_lba = cm.start_lba;
         meta->clusters[i].num_vectors = cm.num_vectors;
         meta->clusters[i].num_lbas = cm.num_lbas;
         meta->clusters[i].sorted_id_base = sorted_base;
-        memcpy(meta->clusters[i].centroid, cm.centroid, sizeof(cm.centroid));
+        meta->clusters[i].centroid = centroid;
         sorted_base += cm.num_vectors;
     }
 
@@ -448,6 +468,7 @@ static void free_ivf_meta(IvfMeta *meta)
     if (!meta) {
         return;
     }
+    free(meta->centroids);
     free(meta->clusters);
     memset(meta, 0, sizeof(*meta));
 }
@@ -507,7 +528,7 @@ static int coarse_search_topn(const float *query, const IvfMeta *meta, uint32_t 
 
     for (uint32_t cid = 0; cid < meta->nlist; cid++) {
         const float *c = meta->clusters[cid].centroid;
-        float dist = full_l2(query, c);
+        float dist = full_l2(query, c, meta->header.dim);
         int pos = -1;
         for (uint32_t i = 0; i < nprobe; i++) {
             if (dist < out_hits[i].dist) {
@@ -684,8 +705,8 @@ static int scan_query_serial(const IvfMeta *meta,
                     uint32_t sorted_pos = ci->sorted_id_base + local_idx;
                     uint32_t vec_id = sorted_ids[sorted_pos];
                     const float *vec = (const float *)(dma_buf + (size_t)b * sector_size +
-                                                       (size_t)lane * DIM * sizeof(float));
-                    float dist = full_l2(vec, query);
+                                                       (size_t)lane * meta->header.dim * sizeof(float));
+                    float dist = full_l2(vec, query, meta->header.dim);
                     topk_insert(topk, vec_id, dist);
                     (*candidates)++;
                 }
@@ -1106,8 +1127,8 @@ int main(int argc, char **argv)
                                  &qs) != 0) {
         goto cleanup;
     }
-    if (qs.dim != DIM) {
-        fprintf(stderr, "query dim mismatch got=%u expected=%u\n", qs.dim, DIM);
+    if (qs.dim != meta.header.dim) {
+        fprintf(stderr, "query dim mismatch got=%u expected=%u\n", qs.dim, meta.header.dim);
         goto cleanup;
     }
 

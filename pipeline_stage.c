@@ -2,6 +2,8 @@
 #include "coarse_search_module.h"
 
 #include <errno.h>
+#include <inttypes.h>
+#include <math.h>
 #include <sched.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -48,6 +50,18 @@ static const char *coarse_backend_name(coarse_backend_t backend)
     }
 }
 
+static const char *prune_threshold_mode_name(prune_threshold_mode_t mode)
+{
+    switch (mode) {
+        case PRUNE_THRESHOLD_CENTROID:
+            return "centroid";
+        case PRUNE_THRESHOLD_SAMPLED:
+            return "sampled";
+        default:
+            return "unknown";
+    }
+}
+
 static coarse_backend_t parse_coarse_backend_name(const char *name)
 {
     if (!name || strcmp(name, "faiss") == 0) {
@@ -59,11 +73,212 @@ static coarse_backend_t parse_coarse_backend_name(const char *name)
     return (coarse_backend_t)-1;
 }
 
+static prune_threshold_mode_t parse_prune_threshold_mode_name(const char *name)
+{
+    if (!name || strcmp(name, "sampled") == 0) {
+        return PRUNE_THRESHOLD_SAMPLED;
+    }
+    if (strcmp(name, "centroid") == 0) {
+        return PRUNE_THRESHOLD_CENTROID;
+    }
+    return (prune_threshold_mode_t)-1;
+}
+
 static void io_done_cb(void *arg, const struct spdk_nvme_cpl *cpl)
 {
     struct io_waiter *wt = (struct io_waiter *)arg;
     wt->ok = !spdk_nvme_cpl_is_error(cpl);
     wt->done = true;
+}
+
+static int read_lba_sync(struct spdk_nvme_ns *ns,
+                         struct spdk_nvme_qpair *qpair,
+                         void *buf,
+                         uint64_t lba,
+                         uint32_t lba_count)
+{
+    struct io_waiter waiter = {.done = false, .ok = 0};
+    int rc = spdk_nvme_ns_cmd_read(ns, qpair, buf, lba, lba_count, io_done_cb, &waiter, 0);
+    if (rc != 0) {
+        return rc;
+    }
+
+    while (!waiter.done) {
+        int cpl_rc = spdk_nvme_qpair_process_completions(qpair, 0);
+        if (cpl_rc < 0) {
+            return cpl_rc;
+        }
+    }
+
+    return waiter.ok ? 0 : -1;
+}
+
+static int build_prune_sample_vectors(pipeline_app_t *app)
+{
+    if (!app || !app->sorted_vec_ids || app->num_sorted_vec_ids == 0) {
+        return -1;
+    }
+
+    const uint32_t total = app->ivf_meta.header.num_vectors;
+    const uint32_t dim = app->ivf_meta.header.dim;
+    const uint32_t sample_count = total < PRUNE_SAMPLE_SIZE ? total : PRUNE_SAMPLE_SIZE;
+    const uint32_t vectors_per_lba = app->ivf_meta.header.vectors_per_lba;
+    struct spdk_nvme_qpair *qpairs[NUM_STAGES] = {0};
+    void *sector_bufs[NUM_STAGES] = {0};
+    int rc = -1;
+
+    if (sample_count == 0 || dim == 0 || vectors_per_lba == 0) {
+        return -1;
+    }
+
+    app->prune_sample_vectors =
+        (float *)calloc((size_t)sample_count * (size_t)dim, sizeof(float));
+    if (!app->prune_sample_vectors) {
+        perror("calloc prune_sample_vectors");
+        return -1;
+    }
+    app->prune_sample_count = sample_count;
+
+    for (int s = 0; s < NUM_STAGES; s++) {
+        qpairs[s] = spdk_nvme_ctrlr_alloc_io_qpair(app->disks[s].ctrlr, NULL, 0);
+        if (!qpairs[s]) {
+            fprintf(stderr, "build_prune_sample_vectors: alloc_io_qpair failed stage=%d disk=%s\n",
+                    s, app->disks[s].traddr);
+            goto cleanup;
+        }
+        sector_bufs[s] = spdk_zmalloc(app->disks[s].sector_size,
+                                      app->disks[s].sector_size,
+                                      NULL,
+                                      SPDK_ENV_NUMA_ID_ANY,
+                                      SPDK_MALLOC_DMA);
+        if (!sector_bufs[s]) {
+            fprintf(stderr, "build_prune_sample_vectors: spdk_zmalloc failed stage=%d\n", s);
+            goto cleanup;
+        }
+    }
+
+    {
+        uint32_t cluster_idx = 0;
+        for (uint32_t i = 0; i < sample_count; i++) {
+            uint64_t sorted_pos = ((uint64_t)i * (uint64_t)total) / (uint64_t)sample_count;
+            while (cluster_idx + 1 < app->ivf_meta.nlist &&
+                   sorted_pos >= (uint64_t)app->ivf_meta.clusters[cluster_idx].sorted_id_base +
+                                     (uint64_t)app->ivf_meta.clusters[cluster_idx].num_vectors) {
+                cluster_idx++;
+            }
+
+            const cluster_info_t *ci = &app->ivf_meta.clusters[cluster_idx];
+            if (sorted_pos < ci->sorted_id_base ||
+                sorted_pos >= (uint64_t)ci->sorted_id_base + (uint64_t)ci->num_vectors) {
+                fprintf(stderr,
+                        "build_prune_sample_vectors: sorted_pos mapping failed pos=%" PRIu64 " cluster=%u base=%u num=%u\n",
+                        sorted_pos, cluster_idx, ci->sorted_id_base, ci->num_vectors);
+                goto cleanup;
+            }
+
+            uint32_t local_idx = (uint32_t)(sorted_pos - (uint64_t)ci->sorted_id_base);
+            uint32_t bundle_idx = local_idx / vectors_per_lba;
+            uint32_t lane_idx = local_idx % vectors_per_lba;
+            float *dst = app->prune_sample_vectors + (size_t)i * (size_t)dim;
+
+            for (int s = 0; s < NUM_STAGES; s++) {
+                uint64_t lba = ci->start_lba + bundle_idx;
+                if (read_lba_sync(app->disks[s].ns, qpairs[s], sector_bufs[s], lba, 1) != 0) {
+                    fprintf(stderr,
+                            "build_prune_sample_vectors: read failed stage=%d cluster=%u lba=%" PRIu64 "\n",
+                            s, ci->cluster_id, lba);
+                    goto cleanup;
+                }
+
+                memcpy((uint8_t *)dst + app->ivf_meta.header.shard_offsets[s] * sizeof(float),
+                       (uint8_t *)sector_bufs[s] + (size_t)lane_idx * app->ivf_meta.header.shard_bytes[s],
+                       app->ivf_meta.header.shard_bytes[s]);
+            }
+        }
+    }
+
+    rc = 0;
+
+cleanup:
+    for (int s = 0; s < NUM_STAGES; s++) {
+        if (sector_bufs[s]) {
+            spdk_free(sector_bufs[s]);
+        }
+        if (qpairs[s]) {
+            spdk_nvme_ctrlr_free_io_qpair(qpairs[s]);
+        }
+    }
+
+    if (rc != 0) {
+        free(app->prune_sample_vectors);
+        app->prune_sample_vectors = NULL;
+        app->prune_sample_count = 0;
+    }
+
+    return rc;
+}
+
+static float compute_sampled_prune_threshold(const pipeline_app_t *app, const float *query)
+{
+    if (!app || !query || !app->prune_sample_vectors || app->prune_sample_count == 0) {
+        return app ? app->threshold : 0.0f;
+    }
+
+    const uint32_t dim = app->ivf_meta.header.dim;
+    const uint32_t k = app->prune_sample_count < PRUNE_SAMPLE_TOPK
+                           ? app->prune_sample_count
+                           : PRUNE_SAMPLE_TOPK;
+    float topk_buf[PRUNE_SAMPLE_TOPK];
+
+    for (uint32_t i = 0; i < k; i++) {
+        topk_buf[i] = INFINITY;
+    }
+
+    for (uint32_t i = 0; i < app->prune_sample_count; i++) {
+        const float *vec = app->prune_sample_vectors + (size_t)i * (size_t)dim;
+        float dist = 0.0f;
+        for (uint32_t d = 0; d < dim; d++) {
+            float diff = vec[d] - query[d];
+            dist += diff * diff;
+        }
+
+        int pos = -1;
+        for (uint32_t j = 0; j < k; j++) {
+            if (dist < topk_buf[j]) {
+                pos = (int)j;
+                break;
+            }
+        }
+        if (pos >= 0) {
+            for (int j = (int)k - 1; j > pos; j--) {
+                topk_buf[j] = topk_buf[j - 1];
+            }
+            topk_buf[pos] = dist;
+        }
+    }
+
+    return k > 0 ? topk_buf[k - 1] : app->threshold;
+}
+
+static float compute_centroid_prune_threshold(const coarse_hit_t *hits,
+                                              uint32_t nprobe,
+                                              float fallback_threshold)
+{
+    if (!hits || nprobe == 0) {
+        return fallback_threshold;
+    }
+
+    uint32_t threshold_rank = nprobe < 50 ? nprobe : 50;
+    if (threshold_rank == 0) {
+        return fallback_threshold;
+    }
+
+    float threshold = hits[threshold_rank - 1].dist;
+    if (!(threshold > 0.0f) || !isfinite(threshold)) {
+        return fallback_threshold;
+    }
+
+    return threshold;
 }
 
 static void free_query_tracker_segments(query_tracker_t *qt)
@@ -802,6 +1017,8 @@ static void *stage_worker_main(void *arg) {
         uint32_t batch_out = 0;              /* 统一定义为本 stage 保留下来的数量 */
         uint32_t child_batches = 0;
         uint32_t batch_bundles_read = 0;
+        uint32_t batch_nvme_reads = 0;
+        uint64_t batch_nvme_read_bytes = 0;
 
         if (in->count > 1) {
             uint64_t qsort_begin_us = now_us();
@@ -835,6 +1052,10 @@ static void *stage_worker_main(void *arg) {
                     break;
                 }
                 slot->submit_rc = submit_vec_bundle_range(w, slot);
+                if (slot->submit_rc == 0) {
+                    batch_nvme_reads++;
+                    batch_nvme_read_bytes += (uint64_t)slot->bundle_count * (uint64_t)w->disk->sector_size;
+                }
                 next_idx = slot->end_idx;
                 inflight++;
                 tail = (tail + 1) % read_depth;
@@ -947,6 +1168,10 @@ static void *stage_worker_main(void *arg) {
                         break;
                     }
                     slot->submit_rc = submit_vec_bundle_range(w, slot);
+                    if (slot->submit_rc == 0) {
+                        batch_nvme_reads++;
+                        batch_nvme_read_bytes += (uint64_t)slot->bundle_count * (uint64_t)w->disk->sector_size;
+                    }
                     next_idx = slot->end_idx;
                     inflight++;
                     tail = (tail + 1) % read_depth;
@@ -987,6 +1212,8 @@ static void *stage_worker_main(void *arg) {
             qt->stage_pruned[w->stage_id] += batch_pruned;
             qt->stage_batches[w->stage_id] += 1;
             qt->stage_bundles_read[w->stage_id] += batch_bundles_read;
+            qt->stage_nvme_reads[w->stage_id] += batch_nvme_reads;
+            qt->stage_nvme_read_bytes[w->stage_id] += batch_nvme_read_bytes;
             qt->stage_wall_us[w->stage_id] += batch_wall_us;
             qt->stage_io_us[w->stage_id] += batch_io_us;
             qt->stage_qsort_us[w->stage_id] += batch_qsort_us;
@@ -1031,12 +1258,14 @@ int pipeline_init(
     uint32_t read_depth,
     uint32_t stage1_gap_merge_limit,
     const char *coarse_backend_name_arg,
+    const char *prune_threshold_mode_name_arg,
     float threshold,
     const char *ivf_meta_path,
     const char *sorted_ids_path
 )
 {
     coarse_backend_t backend = parse_coarse_backend_name(coarse_backend_name_arg);
+    prune_threshold_mode_t prune_mode = parse_prune_threshold_mode_name(prune_threshold_mode_name_arg);
 
     memset(app, 0, sizeof(*app));
 
@@ -1053,12 +1282,19 @@ int pipeline_init(
                 coarse_backend_name_arg ? coarse_backend_name_arg : "(null)");
         return -1;
     }
+    if (prune_mode != PRUNE_THRESHOLD_CENTROID && prune_mode != PRUNE_THRESHOLD_SAMPLED) {
+        fprintf(stderr,
+                "pipeline_init: invalid prune threshold mode '%s' (expected centroid or sampled)\n",
+                prune_threshold_mode_name_arg ? prune_threshold_mode_name_arg : "(null)");
+        return -1;
+    }
 
     fprintf(stderr,
-            "[pipeline_init] begin read_depth=%u stage1_gap_merge_limit=%u coarse_backend=%s ivf_meta=%s sorted_ids=%s\n",
+            "[pipeline_init] begin read_depth=%u stage1_gap_merge_limit=%u coarse_backend=%s prune_threshold_mode=%s ivf_meta=%s sorted_ids=%s\n",
             read_depth,
             stage1_gap_merge_limit,
             coarse_backend_name(backend),
+            prune_threshold_mode_name(prune_mode),
             ivf_meta_path ? ivf_meta_path : "(null)",
             sorted_ids_path ? sorted_ids_path : "(null)");
 
@@ -1076,6 +1312,7 @@ int pipeline_init(
     app->read_depth = read_depth;
     app->stage1_gap_merge_limit = stage1_gap_merge_limit;
     app->coarse_backend = backend;
+    app->prune_threshold_mode = prune_mode;
 
     fprintf(stderr, "[pipeline_init] before parse_ivf_meta\n");
     if (parse_ivf_meta(ivf_meta_path, &app->ivf_meta) != 0) {
@@ -1171,6 +1408,26 @@ int pipeline_init(
         return -1;
     }
 
+    if (app->prune_threshold_mode == PRUNE_THRESHOLD_SAMPLED) {
+        fprintf(stderr, "[pipeline_init] before build_prune_sample_vectors\n");
+        if (build_prune_sample_vectors(app) != 0) {
+            fprintf(stderr, "pipeline_init: failed to build prune sample vectors\n");
+            free(app->sorted_vec_ids);
+            app->sorted_vec_ids = NULL;
+            app->num_sorted_vec_ids = 0;
+            coarse_search_module_destroy(app->coarse_module);
+            app->coarse_module = NULL;
+            free_ivf_meta(&app->ivf_meta);
+            app->centroids = NULL;
+            app->nlist = 0;
+            return -1;
+        }
+        fprintf(stderr, "[pipeline_init] after build_prune_sample_vectors sample_count=%u topk=%u\n",
+                app->prune_sample_count, PRUNE_SAMPLE_TOPK);
+    } else {
+        fprintf(stderr, "[pipeline_init] skip build_prune_sample_vectors for centroid mode\n");
+    }
+
     fprintf(stderr, "[pipeline_init] before worker setup\n");
     pthread_mutex_init(&app->query_mu, NULL);
     memset(app->queries, 0, sizeof(app->queries));
@@ -1189,6 +1446,9 @@ int pipeline_init(
             free(app->sorted_vec_ids);
             app->sorted_vec_ids = NULL;
             app->num_sorted_vec_ids = 0;
+            free(app->prune_sample_vectors);
+            app->prune_sample_vectors = NULL;
+            app->prune_sample_count = 0;
             coarse_search_module_destroy(app->coarse_module);
             app->coarse_module = NULL;
             free_ivf_meta(&app->ivf_meta);
@@ -1295,6 +1555,9 @@ void pipeline_destroy(pipeline_app_t *app) {
 
     coarse_search_module_destroy(app->coarse_module);
     app->coarse_module = NULL;
+    free(app->prune_sample_vectors);
+    app->prune_sample_vectors = NULL;
+    app->prune_sample_count = 0;
     free_ivf_meta(&app->ivf_meta);
     app->centroids = NULL;
     app->nlist = 0;
@@ -1690,15 +1953,22 @@ int submit_query(pipeline_app_t *app,
     }
     qt->coarse_search_us = now_us() - coarse_begin_us;
 
-    uint32_t threshold_rank = nprobe < 50 ? nprobe : 50; // CAUTION!!!! threshold setting
-    if (threshold_rank > 0) {
-        qt->prune_threshold = hits[threshold_rank - 1].dist;
+    if (app->prune_threshold_mode == PRUNE_THRESHOLD_CENTROID) {
+        qt->prune_threshold = compute_centroid_prune_threshold(hits, nprobe, app->threshold);
     } else {
-        qt->prune_threshold = app->threshold;
+        qt->prune_threshold = compute_sampled_prune_threshold(app, query);
+        if (!(qt->prune_threshold > 0.0f) || !isfinite(qt->prune_threshold)) {
+            qt->prune_threshold = app->threshold;
+        }
     }
 
-    printf("[submit_query] qid=%lu nprobe=%u prune_threshold=%f rank=%u\n",
-           qid, nprobe, qt->prune_threshold, threshold_rank);
+    printf("[submit_query] qid=%lu nprobe=%u prune_mode=%s prune_threshold=%f sample_count=%u sample_topk=%u\n",
+           qid,
+           nprobe,
+           prune_threshold_mode_name(app->prune_threshold_mode),
+           qt->prune_threshold,
+           app->prune_sample_count,
+           PRUNE_SAMPLE_TOPK);
 
     /* 4) 依次提交每个命中 cluster 的 candidates */
     uint64_t submit_begin_us = now_us();

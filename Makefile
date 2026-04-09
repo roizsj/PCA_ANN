@@ -26,7 +26,7 @@ FAISS_LIBS := -lfaiss -lstdc++ -lgomp
 BIN_DIR := build/bin
 OBJ_DIR := build/obj
 
-all: $(APP_NAME) ivf_write_disk ivf_write_disk_flex ivf_write_disk_1 ivf_baseline_1 ivf_baseline_2
+all: $(APP_NAME) ivf_write_disk ivf_write_disk_flex ivf_write_disk_1 ivf_baseline_1 ivf_baseline_2 ivf_baseline_2_gist
 
 $(APP_NAME): $(APP_OBJS)
 	@mkdir -p $(BIN_DIR)
@@ -57,6 +57,10 @@ ivf_baseline_2: ivf_baseline_2.c query_loader.c
 	@mkdir -p $(BIN_DIR)
 	$(CC) $(CFLAGS) -o $(BIN_DIR)/$@ ivf_baseline_2.c query_loader.c -lm -pthread 	-Wl,--whole-archive -Wl,-Bstatic $(SPDK_LIBS) 	-Wl,-Bdynamic -Wl,--no-whole-archive $(SPDK_SYSLIBS)
 
+ivf_baseline_2_gist: ivf_baseline_2_gist.c query_loader.c
+	@mkdir -p $(BIN_DIR)
+	$(CC) $(CFLAGS) -o $(BIN_DIR)/$@ ivf_baseline_2_gist.c query_loader.c -lm -pthread 	-Wl,--whole-archive -Wl,-Bstatic $(SPDK_LIBS) 	-Wl,-Bdynamic -Wl,--no-whole-archive $(SPDK_SYSLIBS)
+
 clean:
-	rm -f $(BIN_DIR)/$(APP_NAME) $(BIN_DIR)/ivf_write_disk $(BIN_DIR)/ivf_write_disk_flex $(BIN_DIR)/ivf_write_disk_1 $(BIN_DIR)/ivf_baseline_1 $(BIN_DIR)/ivf_baseline_2
+	rm -f $(BIN_DIR)/$(APP_NAME) $(BIN_DIR)/ivf_write_disk $(BIN_DIR)/ivf_write_disk_flex $(BIN_DIR)/ivf_write_disk_1 $(BIN_DIR)/ivf_baseline_1 $(BIN_DIR)/ivf_baseline_2 $(BIN_DIR)/ivf_baseline_2_gist
 	rm -rf $(OBJ_DIR)
