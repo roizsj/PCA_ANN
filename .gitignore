@@ -1,4 +1,5 @@
 preprocessing/gist1m_output
 preprocessing/ivf_output
 preprocessing/pca_output
+preprocessing/gist1m_ivfpq_output
 build/
