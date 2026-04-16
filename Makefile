@@ -26,7 +26,7 @@ FAISS_LIBS := -lfaiss -lstdc++ -lgomp
 BIN_DIR := build/bin
 OBJ_DIR := build/obj
 
-all: $(APP_NAME) ivf_write_disk ivf_write_disk_flex ivf_write_disk_1 ivf_write_disk_4way_gist ivf_baseline_1 ivf_baseline_2 ivf_baseline_2_gist ivf_baseline_4way_gist
+all: $(APP_NAME) ivf_write_disk ivf_write_disk_flex ivf_write_disk_overlap_flex ivf_write_disk_1 ivf_write_disk_4way_gist ivf_pq_write_disk_gist ivf_baseline_1 ivf_baseline_2 ivf_baseline_2_gist ivf_baseline_4way_gist ivf_pq_baseline_gist
 
 $(APP_NAME): $(APP_OBJS)
 	@mkdir -p $(BIN_DIR)
@@ -48,6 +48,10 @@ ivf_write_disk_flex: write_disk/ivf_write_disk_flex.c
 	@mkdir -p $(BIN_DIR)
 	$(CC) $(CFLAGS) -o $(BIN_DIR)/$@ write_disk/ivf_write_disk_flex.c -pthread 	-Wl,--whole-archive -Wl,-Bstatic $(SPDK_LIBS) 	-Wl,-Bdynamic -Wl,--no-whole-archive $(SPDK_SYSLIBS)
 
+ivf_write_disk_overlap_flex: write_disk/ivf_write_disk_overlap_flex.c
+	@mkdir -p $(BIN_DIR)
+	$(CC) $(CFLAGS) -o $(BIN_DIR)/$@ write_disk/ivf_write_disk_overlap_flex.c -pthread 	-Wl,--whole-archive -Wl,-Bstatic $(SPDK_LIBS) 	-Wl,-Bdynamic -Wl,--no-whole-archive $(SPDK_SYSLIBS)
+
 ivf_write_disk_1: write_disk/ivf_write_disk_1.c
 	@mkdir -p $(BIN_DIR)
 	$(CC) $(CFLAGS) -o $(BIN_DIR)/$@ write_disk/ivf_write_disk_1.c -pthread 	-Wl,--whole-archive -Wl,-Bstatic $(SPDK_LIBS) 	-Wl,-Bdynamic -Wl,--no-whole-archive $(SPDK_SYSLIBS)
@@ -55,6 +59,10 @@ ivf_write_disk_1: write_disk/ivf_write_disk_1.c
 ivf_write_disk_4way_gist: write_disk/ivf_write_disk_4way_gist.c
 	@mkdir -p $(BIN_DIR)
 	$(CC) $(CFLAGS) -o $(BIN_DIR)/$@ write_disk/ivf_write_disk_4way_gist.c -pthread 	-Wl,--whole-archive -Wl,-Bstatic $(SPDK_LIBS) 	-Wl,-Bdynamic -Wl,--no-whole-archive $(SPDK_SYSLIBS)
+
+ivf_pq_write_disk_gist: write_disk/ivf_pq_write_disk_gist.c
+	@mkdir -p $(BIN_DIR)
+	$(CC) $(CFLAGS) -o $(BIN_DIR)/$@ write_disk/ivf_pq_write_disk_gist.c -pthread 	-Wl,--whole-archive -Wl,-Bstatic $(SPDK_LIBS) 	-Wl,-Bdynamic -Wl,--no-whole-archive $(SPDK_SYSLIBS)
 
 ivf_baseline_1: baseline/ivf_baseline_1.c query_loader.c
 	@mkdir -p $(BIN_DIR)
@@ -72,6 +80,10 @@ ivf_baseline_4way_gist: baseline/ivf_baseline_4way_gist.c query_loader.c
 	@mkdir -p $(BIN_DIR)
 	$(CC) $(CFLAGS) -o $(BIN_DIR)/$@ baseline/ivf_baseline_4way_gist.c query_loader.c -lm -pthread 	-Wl,--whole-archive -Wl,-Bstatic $(SPDK_LIBS) 	-Wl,-Bdynamic -Wl,--no-whole-archive $(SPDK_SYSLIBS)
 
+ivf_pq_baseline_gist: baseline/ivf_pq_baseline_gist.c query_loader.c
+	@mkdir -p $(BIN_DIR)
+	$(CC) $(CFLAGS) -o $(BIN_DIR)/$@ baseline/ivf_pq_baseline_gist.c query_loader.c -lm -pthread 	-Wl,--whole-archive -Wl,-Bstatic $(SPDK_LIBS) 	-Wl,-Bdynamic -Wl,--no-whole-archive $(SPDK_SYSLIBS)
+
 clean:
-	rm -f $(BIN_DIR)/$(APP_NAME) $(BIN_DIR)/ivf_write_disk $(BIN_DIR)/ivf_write_disk_flex $(BIN_DIR)/ivf_write_disk_1 $(BIN_DIR)/ivf_write_disk_4way_gist $(BIN_DIR)/ivf_baseline_1 $(BIN_DIR)/ivf_baseline_2 $(BIN_DIR)/ivf_baseline_2_gist $(BIN_DIR)/ivf_baseline_4way_gist
+	rm -f $(BIN_DIR)/$(APP_NAME) $(BIN_DIR)/ivf_write_disk $(BIN_DIR)/ivf_write_disk_flex $(BIN_DIR)/ivf_write_disk_overlap_flex $(BIN_DIR)/ivf_write_disk_1 $(BIN_DIR)/ivf_write_disk_4way_gist $(BIN_DIR)/ivf_pq_write_disk_gist $(BIN_DIR)/ivf_baseline_1 $(BIN_DIR)/ivf_baseline_2 $(BIN_DIR)/ivf_baseline_2_gist $(BIN_DIR)/ivf_baseline_4way_gist $(BIN_DIR)/ivf_pq_baseline_gist
 	rm -rf $(OBJ_DIR)
