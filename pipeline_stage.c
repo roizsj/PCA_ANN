@@ -1086,7 +1086,7 @@ static void *stage_worker_main(void *arg) {
         const uint32_t vectors_per_lba = app->ivf_meta.header.vectors_per_lba;
         const uint32_t stage_dim = app->ivf_meta.header.shard_dims[w->stage_id];
         const uint32_t shard_bytes = app->ivf_meta.header.shard_bytes[w->stage_id];
-        const uint32_t max_gap_bundles = (w->stage_id == 1) ? app->stage1_gap_merge_limit : 0u;
+        const uint32_t max_gap_bundles = (w->stage_id >= 1) ? app->stage1_gap_merge_limit : 0u;
 
         if (in->count > 0) {
             uint16_t next_idx = 0;

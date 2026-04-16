@@ -21,14 +21,14 @@
 #define TOPK 10
 #define MAGIC_META 0x49564633u
 
-static const char *DEFAULT_META_PATH = "./preprocessing/ivf_output/ivf_meta_1_disk.bin";
-static const char *DEFAULT_SORTED_IDS_PATH = "./preprocessing/ivf_output/sorted_vec_ids_1_disk.bin";
+static const char *DEFAULT_META_PATH = "/home/zhangshujie/ann_ssd/pca_ann/preprocessing/ivf_output/ivf_meta_1_disk.bin";
+static const char *DEFAULT_SORTED_IDS_PATH = "/home/zhangshujie/ann_ssd/pca_ann/preprocessing/ivf_output/sorted_vec_ids_1_disk.bin";
 static const char *DEFAULT_QUERY_FVECS_PATH = "/home/zhangshujie/ann_nic/sift/sift_query.fvecs";
 static const char *DEFAULT_GT_IVECS_PATH = "/home/zhangshujie/ann_nic/sift/sift_groundtruth.ivecs";
-static const char *DEFAULT_PCA_MEAN_PATH = "./preprocessing/pca_output/pca_mean.bin";
-static const char *DEFAULT_PCA_COMPONENTS_PATH = "./preprocessing/pca_output/pca_components.bin";
-static const char *DEFAULT_PCA_EV_PATH = "./preprocessing/pca_output/pca_explained_variance.bin";
-static const char *DEFAULT_PCA_META_PATH = "./preprocessing/pca_output/pca_meta.bin";
+static const char *DEFAULT_PCA_MEAN_PATH = "/home/zhangshujie/ann_ssd/pca_ann/preprocessing/pca_output/pca_mean.bin";
+static const char *DEFAULT_PCA_COMPONENTS_PATH = "/home/zhangshujie/ann_ssd/pca_ann/preprocessing/pca_output/pca_components.bin";
+static const char *DEFAULT_PCA_EV_PATH = "/home/zhangshujie/ann_ssd/pca_ann/preprocessing/pca_output/pca_explained_variance.bin";
+static const char *DEFAULT_PCA_META_PATH = "/home/zhangshujie/ann_ssd/pca_ann/preprocessing/pca_output/pca_meta.bin";
 
 typedef struct {
     uint32_t magic;
