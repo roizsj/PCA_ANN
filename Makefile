@@ -3,7 +3,7 @@ APP_NAME := pca_ann
 PKG_CONFIG ?= pkg-config
 FAISS_DIR ?= /home/zhangshujie/opt/faiss
 
-APP_C_SRCS := 	main.c 	pipeline_stage.c 	query_loader.c
+APP_C_SRCS := 	main.c 	pipeline_stage.c 	pipeline_queue.c 	pipeline_meta.c 	pipeline_query.c 	query_loader.c
 
 APP_CXX_SRCS := 	coarse_search_faiss.cpp
 

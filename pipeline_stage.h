@@ -532,6 +532,12 @@ query_tracker_t *register_query(pipeline_app_t *app,
                                 uint32_t nprobe,
                                 uint32_t num_probed_clusters);
 
+void pipeline_free_query_tracker_segments(query_tracker_t *qt);
+
+query_tracker_t *pipeline_find_query_tracker_locked(pipeline_app_t *app, uint64_t qid);
+
+void pipeline_maybe_mark_query_done_locked(query_tracker_t *qt);
+
 void mark_batch_finished(pipeline_app_t *app, uint64_t qid, uint32_t spawned_batches);
 
 int wait_query_done(pipeline_app_t *app, uint64_t qid, uint32_t timeout_ms);

@@ -31,6 +31,32 @@ struct bundle_run {
     bool completion_seen;
 };
 
+struct worker_io_state {
+    uint32_t read_depth;
+    uint32_t max_bundles_per_read;
+    void **read_bufs;
+    struct bundle_run *run_slots;
+    uint16_t *ready_slots;
+};
+
+struct worker_query_ctx {
+    const float *query_seg;
+    float prune_threshold;
+};
+
+struct worker_batch_stats {
+    uint64_t batch_begin_us;
+    uint64_t batch_qsort_us;
+    uint64_t batch_io_us;
+    uint32_t batch_in;
+    uint32_t batch_pruned;
+    uint32_t batch_out;
+    uint32_t child_batches;
+    uint32_t batch_bundles_read;
+    uint32_t batch_nvme_reads;
+    uint64_t batch_nvme_read_bytes;
+};
+
 static __thread uint32_t tls_vectors_per_lba_for_sort = 1;
 
 static inline uint64_t now_us(void)
@@ -281,271 +307,6 @@ static float compute_centroid_prune_threshold(const coarse_hit_t *hits,
     }
 
     return threshold;
-}
-
-static void free_query_tracker_segments(query_tracker_t *qt)
-{
-    if (!qt) {
-        return;
-    }
-
-    for (int s = 0; s < NUM_STAGES; s++) {
-        free(qt->query_segs[s]);
-        qt->query_segs[s] = NULL;
-    }
-}
-
-int parse_ivf_meta(const char* filename, ivf_meta_t *meta) {
-    if (!meta) return -1;
-    memset(meta, 0, sizeof(*meta));
-
-    FILE* fp = fopen(filename, "rb");
-    if (!fp) {
-        perror("fopen");
-        return -1;
-    }
-
-    ivf_meta_header_t header;
-    if (fread(&header, sizeof(header), 1, fp) != 1) {
-        fprintf(stderr, "Failed to read MetaHeader\n");
-        fclose(fp);
-        return -1;
-    }
-
-    if (header.magic != IVF_META_MAGIC_FLEX) {
-        fprintf(stderr, "Invalid magic number: 0x%08X\n", header.magic);
-        fclose(fp);
-        return -1;
-    }
-
-    if (header.version != 1) {
-        fprintf(stderr, "Unsupported IVF meta version: %u\n", header.version);
-        fclose(fp);
-        return -1;
-    }
-
-    if (header.num_shards != NUM_STAGES) {
-        fprintf(stderr, "Unsupported num_shards: %u expected=%d\n",
-                header.num_shards, NUM_STAGES);
-        fclose(fp);
-        return -1;
-    }
-
-    if (header.dim == 0 || header.nlist == 0 || header.vectors_per_lba == 0) {
-        fprintf(stderr,
-                "Invalid flex IVF header: dim=%u nlist=%u vectors_per_lba=%u\n",
-                header.dim, header.nlist, header.vectors_per_lba);
-        fclose(fp);
-        return -1;
-    }
-
-    meta->header = header;
-    meta->nlist = header.nlist;
-
-    meta->clusters = malloc(header.nlist * sizeof(cluster_info_t));
-    if (!meta->clusters) {
-        perror("malloc clusters");
-        fclose(fp);
-        return -1;
-    }
-
-    meta->centroids = malloc((size_t)header.nlist * (size_t)header.dim * sizeof(float));
-    if (!meta->centroids) {
-        perror("malloc centroids");
-        free(meta->clusters);
-        meta->clusters = NULL;
-        fclose(fp);
-        return -1;
-    }
-
-    uint32_t sorted_id_base = 0;
-    for (uint32_t i = 0; i < header.nlist; i++) {
-        ClusterMetaOnDisk cm;
-
-        if (fread(&cm, sizeof(cm), 1, fp) != 1) {
-            fprintf(stderr, "Failed to read cluster %u metadata\n", i);
-            free_ivf_meta(meta);
-            fclose(fp);
-            return -1;
-        }
-
-        if (cm.cluster_id != i) {
-            fprintf(stderr,
-                    "parse_ivf_meta: unsupported cluster_id layout at idx=%u cluster_id=%u\n",
-                    i, cm.cluster_id);
-            free_ivf_meta(meta);
-            fclose(fp);
-            return -1;
-        }
-
-        meta->clusters[i].cluster_id = cm.cluster_id;
-        meta->clusters[i].start_lba = cm.start_lba;
-        meta->clusters[i].num_vectors = cm.num_vectors;
-        meta->clusters[i].num_lbas = cm.num_lbas;
-        meta->clusters[i].sorted_id_base = sorted_id_base;
-        sorted_id_base += cm.num_vectors;
-    }
-
-    {
-        size_t want = (size_t)header.nlist * (size_t)header.dim;
-        if (fread(meta->centroids, sizeof(float), want, fp) != want) {
-            fprintf(stderr, "Failed to read centroids payload from %s\n", filename);
-            free_ivf_meta(meta);
-            fclose(fp);
-            return -1;
-        }
-    }
-
-    fclose(fp);
-    return 0;
-}
-
-int load_sorted_ids_bin(const char *path, uint32_t *num_vectors_out, uint32_t **sorted_ids_out)
-{
-    if (!path || !num_vectors_out || !sorted_ids_out) {
-        return -1;
-    }
-
-    *num_vectors_out = 0;
-    *sorted_ids_out = NULL;
-
-    FILE *fp = fopen(path, "rb");
-    if (!fp) {
-        perror("fopen sorted ids");
-        return -1;
-    }
-
-    uint32_t num_vectors = 0;
-    if (fread(&num_vectors, sizeof(uint32_t), 1, fp) != 1) {
-        fprintf(stderr, "load_sorted_ids_bin: failed to read count\n");
-        fclose(fp);
-        return -1;
-    }
-
-    uint32_t *sorted_ids = (uint32_t *)malloc((size_t)num_vectors * sizeof(uint32_t));
-    if (!sorted_ids) {
-        perror("malloc sorted ids");
-        fclose(fp);
-        return -1;
-    }
-
-    if (fread(sorted_ids, sizeof(uint32_t), num_vectors, fp) != num_vectors) {
-        fprintf(stderr, "load_sorted_ids_bin: failed to read body\n");
-        free(sorted_ids);
-        fclose(fp);
-        return -1;
-    }
-
-    fclose(fp);
-    *num_vectors_out = num_vectors;
-    *sorted_ids_out = sorted_ids;
-    return 0;
-}
-
-// 释放ivf_meta_t结构体及其内部内存
-void free_ivf_meta(ivf_meta_t *meta) {
-    if (!meta) return;
-    free(meta->clusters);
-    free(meta->centroids);
-    meta->clusters = NULL;
-    meta->centroids = NULL;
-    meta->nlist = 0;
-    memset(&meta->header, 0, sizeof(meta->header));
-}
-
-// 通过qid查找query_tracker_t的辅助函数，要求调用时已经持有app->query_mu锁
-static query_tracker_t *find_query_tracker_locked(pipeline_app_t *app, uint64_t qid)
-{
-    for (uint32_t i = 0; i < MAX_QUERIES_IN_FLIGHT; i++) {
-        if (app->queries[i].qid == qid) {
-            return &app->queries[i];
-        }
-    }
-    return NULL;
-}
-
-static void maybe_mark_query_done_locked(query_tracker_t *qt)
-{
-    if (!qt) {
-        return;
-    }
-
-    if (!qt->done && qt->submission_done && qt->outstanding_batches == 0) {
-        qt->done = true;
-        qt->done_ts_us = now_us();
-    }
-}
-
-
-
-/* ============================================================
- * 1. 一个非常简单的指针队列
- *
- * 作用：
- *   - 每个 stage worker 有一个输入队列
- *   - topk worker 也有一个输入队列
- *   - 上游 stage 处理完 surviving batch 后，把 batch 指针塞到下游队列
- *
- * 这里为了先跑通功能，使用 pthread mutex + cond 实现。
- * 不追求极致性能，只追求清晰和稳定。
- * ============================================================ */
-
-void queue_init(ptr_queue_t *q) {
-    memset(q, 0, sizeof(*q));
-    pthread_mutex_init(&q->mu, NULL);
-    pthread_cond_init(&q->cv, NULL);
-}
-
-void queue_close(ptr_queue_t *q) {
-    pthread_mutex_lock(&q->mu);
-    q->closed = true;
-    pthread_cond_broadcast(&q->cv);
-    pthread_mutex_unlock(&q->mu);
-}
-
-void queue_push(ptr_queue_t *q, void *ptr) {
-    qnode_t *n = calloc(1, sizeof(*n));
-    if (!n) {
-        perror("calloc qnode");
-        exit(1);
-    }
-    n->ptr = ptr;
-
-    pthread_mutex_lock(&q->mu);
-    if (q->tail) {
-        q->tail->next = n;
-    } else {
-        q->head = n;
-    }
-    q->tail = n;
-    pthread_cond_signal(&q->cv);
-    pthread_mutex_unlock(&q->mu);
-}
-
-void *queue_pop(ptr_queue_t *q) {
-    pthread_mutex_lock(&q->mu);
-
-    while (!q->head && !q->closed) {
-        pthread_cond_wait(&q->cv, &q->mu);
-    }
-
-    /* 队列已关闭且为空 */
-    if (!q->head) {
-        pthread_mutex_unlock(&q->mu);
-        return NULL;
-    }
-
-    qnode_t *n = q->head;
-    q->head = n->next;
-    if (!q->head) {
-        q->tail = NULL;
-    }
-
-    pthread_mutex_unlock(&q->mu);
-
-    void *p = n->ptr;
-    free(n);
-    return p;
 }
 
 /* ============================================================
@@ -899,6 +660,375 @@ static batch_t *append_bundle_group_to_out(pipeline_app_t *app,
     return out;
 }
 
+static int stage_worker_alloc_qpair(stage_worker_t *w)
+{
+    w->qpair = spdk_nvme_ctrlr_alloc_io_qpair(w->disk->ctrlr, NULL, 0);
+    if (!w->qpair) {
+        fprintf(stderr,
+                "alloc_io_qpair failed worker=%d stage=%d lane=%d disk=%s sector=%u\n",
+                w->worker_id,
+                w->stage_id,
+                w->lane_id,
+                w->disk->traddr,
+                w->disk->sector_size);
+        return -1;
+    }
+    return 0;
+}
+
+static uint32_t stage_worker_max_bundles_per_read(const pipeline_app_t *app,
+                                                  const stage_worker_t *w)
+{
+    uint32_t max_bundles_per_read =
+        spdk_nvme_ns_get_max_io_xfer_size(w->disk->ns) / w->disk->sector_size;
+
+    if (max_bundles_per_read == 0) {
+        max_bundles_per_read = 1;
+    }
+    if (app->max_read_lbas > 0 && app->max_read_lbas < max_bundles_per_read) {
+        max_bundles_per_read = app->max_read_lbas;
+    }
+    if (w->stage_id == 0 &&
+        app->stage0_max_read_lbas > 0 &&
+        app->stage0_max_read_lbas < max_bundles_per_read) {
+        max_bundles_per_read = app->stage0_max_read_lbas;
+    }
+    if (max_bundles_per_read > MAX_BATCH) {
+        max_bundles_per_read = MAX_BATCH;
+    }
+
+    return max_bundles_per_read;
+}
+
+static int stage_worker_init_io_state(stage_worker_t *w, struct worker_io_state *io)
+{
+    const pipeline_app_t *app = w->app;
+    const size_t buf_bytes = (size_t)w->disk->sector_size * MAX_BATCH;
+
+    memset(io, 0, sizeof(*io));
+    io->read_depth = app->read_depth;
+    io->max_bundles_per_read = stage_worker_max_bundles_per_read(app, w);
+    io->read_bufs = calloc(io->read_depth, sizeof(*io->read_bufs));
+    io->run_slots = calloc(io->read_depth, sizeof(*io->run_slots));
+    io->ready_slots = calloc(io->read_depth, sizeof(*io->ready_slots));
+    if (!io->read_bufs || !io->run_slots || !io->ready_slots) {
+        fprintf(stderr,
+                "worker=%d failed to allocate read-depth state depth=%u\n",
+                w->worker_id,
+                io->read_depth);
+        return -1;
+    }
+
+    for (uint32_t i = 0; i < io->read_depth; i++) {
+        io->read_bufs[i] = spdk_zmalloc(buf_bytes,
+                                        4096,
+                                        NULL,
+                                        SPDK_ENV_NUMA_ID_ANY,
+                                        SPDK_MALLOC_DMA);
+        if (!io->read_bufs[i]) {
+            fprintf(stderr,
+                    "spdk_zmalloc failed worker=%d read_buf[%u] depth=%u\n",
+                    w->worker_id,
+                    i,
+                    io->read_depth);
+            return -1;
+        }
+    }
+
+    return 0;
+}
+
+static void stage_worker_cleanup_io_state(stage_worker_t *w, struct worker_io_state *io)
+{
+    if (io) {
+        for (uint32_t i = 0; i < io->read_depth; i++) {
+            if (io->read_bufs && io->read_bufs[i]) {
+                spdk_free(io->read_bufs[i]);
+            }
+        }
+        free(io->ready_slots);
+        free(io->run_slots);
+        free(io->read_bufs);
+        memset(io, 0, sizeof(*io));
+    }
+
+    if (w->qpair) {
+        spdk_nvme_ctrlr_free_io_qpair(w->qpair);
+        w->qpair = NULL;
+    }
+}
+
+static int stage_worker_load_query_ctx(stage_worker_t *w,
+                                       uint64_t qid,
+                                       struct worker_query_ctx *ctx)
+{
+    pipeline_app_t *app = w->app;
+
+    memset(ctx, 0, sizeof(*ctx));
+    ctx->prune_threshold = app->threshold;
+
+    pthread_mutex_lock(&app->query_mu);
+    query_tracker_t *qt = pipeline_find_query_tracker_locked(app, qid);
+    if (qt) {
+        ctx->query_seg = qt->query_segs[w->stage_id];
+        if (qt->prune_threshold > 0.0f) {
+            ctx->prune_threshold = qt->prune_threshold;
+        }
+    }
+    pthread_mutex_unlock(&app->query_mu);
+
+    if (!ctx->query_seg) {
+        fprintf(stderr,
+                "[stage %d lane %d] query seg not found for qid=%lu\n",
+                w->stage_id,
+                w->lane_id,
+                qid);
+        return -1;
+    }
+
+    return 0;
+}
+
+static void stage_worker_sort_batch(pipeline_app_t *app,
+                                    batch_t *in,
+                                    struct worker_batch_stats *stats)
+{
+    if (!in || in->count <= 1) {
+        return;
+    }
+
+    uint64_t qsort_begin_us = now_us();
+    tls_vectors_per_lba_for_sort = app->ivf_meta.header.vectors_per_lba;
+    qsort(in->items, in->count, sizeof(in->items[0]), cmp_cand_item_by_bundle);
+    stats->batch_qsort_us += now_us() - qsort_begin_us;
+}
+
+static void stage_worker_finish_run(stage_worker_t *w,
+                                    const batch_t *in,
+                                    batch_t **out,
+                                    const struct worker_query_ctx *query_ctx,
+                                    struct worker_batch_stats *stats,
+                                    cand_item_t *bundle_items,
+                                    uint16_t *bundle_item_count,
+                                    uint32_t *current_bundle_cluster,
+                                    uint32_t *current_bundle_idx,
+                                    struct bundle_run *run)
+{
+    pipeline_app_t *app = w->app;
+    const uint32_t vectors_per_lba = app->ivf_meta.header.vectors_per_lba;
+    const uint32_t stage_dim = app->ivf_meta.header.shard_dims[w->stage_id];
+    const uint32_t shard_bytes = app->ivf_meta.header.shard_bytes[w->stage_id];
+    uint64_t run_io_us = run->complete_us > run->submit_us
+                             ? (run->complete_us - run->submit_us)
+                             : 0;
+    int io_rc = run->submit_rc;
+
+    stats->batch_io_us += run_io_us;
+    if (io_rc == 0 && run->waiter.ok) {
+        stats->batch_bundles_read += run->bundle_count;
+    } else if (io_rc == 0) {
+        io_rc = -1;
+    }
+
+    if (io_rc != 0) {
+        fprintf(stderr,
+                "[stage %d] merged bundle read failed cluster=%u start_bundle=%u bundle_count=%u disk=%s\n",
+                w->stage_id,
+                run->cluster_id,
+                run->start_bundle,
+                run->bundle_count,
+                w->disk->traddr);
+        return;
+    }
+
+    for (uint16_t k = run->begin_idx; k < run->end_idx; k++) {
+        uint32_t vec_id = in->items[k].vec_id;
+        uint32_t cluster_id = in->items[k].cluster_id;
+        uint32_t local_idx = in->items[k].local_idx;
+        float acc = in->items[k].partial_sum;
+        uint32_t bundle_idx = local_idx / vectors_per_lba;
+        uint32_t lane_idx = local_idx % vectors_per_lba;
+        uint32_t bundle_offset = bundle_idx - run->start_bundle;
+        float *seg = (float *)((uint8_t *)run->buf +
+                               (size_t)bundle_offset * w->disk->sector_size +
+                               (size_t)lane_idx * shard_bytes);
+
+        acc += partial_l2(seg, query_ctx->query_seg, stage_dim);
+        if (acc > query_ctx->prune_threshold) {
+            stats->batch_pruned++;
+            continue;
+        }
+
+        stats->batch_out++;
+        if (*current_bundle_cluster != cluster_id || *current_bundle_idx != bundle_idx) {
+            *out = append_bundle_group_to_out(app,
+                                              *out,
+                                              bundle_items,
+                                              *bundle_item_count,
+                                              &stats->child_batches);
+            *bundle_item_count = 0;
+            *current_bundle_cluster = cluster_id;
+            *current_bundle_idx = bundle_idx;
+        }
+
+        bundle_items[*bundle_item_count].vec_id = vec_id;
+        bundle_items[*bundle_item_count].cluster_id = cluster_id;
+        bundle_items[*bundle_item_count].local_idx = local_idx;
+        bundle_items[*bundle_item_count].partial_sum = acc;
+        (*bundle_item_count)++;
+    }
+}
+
+static void stage_worker_process_batch(stage_worker_t *w,
+                                       batch_t *in,
+                                       const struct worker_io_state *io)
+{
+    pipeline_app_t *app = w->app;
+    struct worker_query_ctx query_ctx;
+    struct worker_batch_stats stats = {
+        .batch_begin_us = now_us(),
+        .batch_in = in->count,
+    };
+    cand_item_t bundle_items[MAX_BATCH];
+    uint16_t bundle_item_count = 0;
+    uint32_t current_bundle_cluster = UINT32_MAX;
+    uint32_t current_bundle_idx = UINT32_MAX;
+    batch_t *out = alloc_stage_out_batch(in->qid, in->stage + 1);
+
+    if (stage_worker_load_query_ctx(w, in->qid, &query_ctx) != 0) {
+        free(out);
+        free(in);
+        return;
+    }
+
+    stage_worker_sort_batch(app, in, &stats);
+
+    if (in->count > 0) {
+        const uint32_t vectors_per_lba = app->ivf_meta.header.vectors_per_lba;
+        const uint32_t max_gap_bundles = (w->stage_id == 0)
+                                             ? app->stage0_gap_merge_limit
+                                             : app->stage1_gap_merge_limit;
+        uint16_t next_idx = 0;
+        uint32_t inflight = 0;
+        uint32_t ready_head = 0;
+        uint32_t ready_tail = 0;
+        uint32_t ready_count = 0;
+
+        while (next_idx < in->count || inflight > 0 || ready_count > 0) {
+            for (uint32_t slot_idx = 0;
+                 next_idx < in->count && inflight < io->read_depth && slot_idx < io->read_depth;
+                 slot_idx++) {
+                struct bundle_run *slot = &io->run_slots[slot_idx];
+                if (slot->submitted) {
+                    continue;
+                }
+                if (!plan_bundle_run(in,
+                                     next_idx,
+                                     vectors_per_lba,
+                                     io->max_bundles_per_read,
+                                     max_gap_bundles,
+                                     io->read_bufs[slot_idx],
+                                     slot)) {
+                    next_idx = in->count;
+                    break;
+                }
+                slot->submit_rc = submit_vec_bundle_range(w, slot);
+                if (slot->submit_rc == 0) {
+                    stats.batch_nvme_reads++;
+                    stats.batch_nvme_read_bytes +=
+                        (uint64_t)slot->bundle_count * (uint64_t)w->disk->sector_size;
+                } else {
+                    slot->submitted = false;
+                }
+                next_idx = slot->end_idx;
+                inflight++;
+            }
+
+            if (ready_count == 0 && inflight > 0) {
+                int collect_rc = collect_completed_runs(w,
+                                                       io->run_slots,
+                                                       io->read_depth,
+                                                       io->ready_slots,
+                                                       &ready_tail,
+                                                       &ready_count);
+                if (collect_rc != 0) {
+                    fprintf(stderr,
+                            "[stage %d] process completions failed rc=%d disk=%s\n",
+                            w->stage_id,
+                            collect_rc,
+                            w->disk->traddr);
+                    break;
+                }
+                if (ready_count == 0) {
+                    continue;
+                }
+            }
+
+            if (ready_count == 0) {
+                continue;
+            }
+
+            uint16_t slot_idx = io->ready_slots[ready_head];
+            struct bundle_run *cur_run = &io->run_slots[slot_idx];
+
+            ready_head = (ready_head + 1) % io->read_depth;
+            ready_count--;
+
+            stage_worker_finish_run(w,
+                                    in,
+                                    &out,
+                                    &query_ctx,
+                                    &stats,
+                                    bundle_items,
+                                    &bundle_item_count,
+                                    &current_bundle_cluster,
+                                    &current_bundle_idx,
+                                    cur_run);
+
+            inflight--;
+            cur_run->submitted = false;
+            cur_run->completion_seen = false;
+        }
+    }
+
+    out = append_bundle_group_to_out(app,
+                                     out,
+                                     bundle_items,
+                                     bundle_item_count,
+                                     &stats.child_batches);
+
+    if (out->count > 0) {
+        emit_out_batch(app, out, &stats.child_batches);
+    } else {
+        free(out);
+    }
+
+    uint64_t batch_wall_us = now_us() - stats.batch_begin_us;
+
+    __atomic_fetch_add(&app->stage_in[w->stage_id], stats.batch_in, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&app->stage_out[w->stage_id], stats.batch_out, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&app->stage_pruned[w->stage_id], stats.batch_pruned, __ATOMIC_RELAXED);
+
+    pthread_mutex_lock(&app->query_mu);
+    query_tracker_t *qt = pipeline_find_query_tracker_locked(app, in->qid);
+    if (qt) {
+        qt->stage_in[w->stage_id] += stats.batch_in;
+        qt->stage_out[w->stage_id] += stats.batch_out;
+        qt->stage_pruned[w->stage_id] += stats.batch_pruned;
+        qt->stage_batches[w->stage_id] += 1;
+        qt->stage_bundles_read[w->stage_id] += stats.batch_bundles_read;
+        qt->stage_nvme_reads[w->stage_id] += stats.batch_nvme_reads;
+        qt->stage_nvme_read_bytes[w->stage_id] += stats.batch_nvme_read_bytes;
+        qt->stage_wall_us[w->stage_id] += batch_wall_us;
+        qt->stage_io_us[w->stage_id] += stats.batch_io_us;
+        qt->stage_qsort_us[w->stage_id] += stats.batch_qsort_us;
+    }
+    pthread_mutex_unlock(&app->query_mu);
+
+    mark_batch_finished(app, in->qid, stats.child_batches);
+    free(in);
+}
+
 /* ============================================================
  * 6. topk 线程
  *
@@ -929,7 +1059,7 @@ static void *topk_thread_main(void *arg) {
         }
 
         pthread_mutex_lock(&tw->app->query_mu);
-        query_tracker_t *qt = find_query_tracker_locked(tw->app, b->qid);
+        query_tracker_t *qt = pipeline_find_query_tracker_locked(tw->app, b->qid);
         if (qt) {
             for (uint16_t i = 0; i < b->count; i++) {
                 topk_insert(&qt->query_topk, b->items[i].vec_id, b->items[i].partial_sum);
@@ -969,84 +1099,16 @@ static void *topk_thread_main(void *arg) {
 
 static void *stage_worker_main(void *arg) {
     stage_worker_t *w = arg;
+    struct worker_io_state io;
+
     bind_to_core(w->core_id);
 
-    pipeline_app_t *app = w->app;
-
-    /* 每个 worker 自己独占一个 qpair */
-    w->qpair = spdk_nvme_ctrlr_alloc_io_qpair(w->disk->ctrlr, NULL, 0);
-    if (!w->qpair) {
-        fprintf(stderr,
-        "alloc_io_qpair failed worker=%d stage=%d lane=%d disk=%s sector=%u\n",
-        w->worker_id, w->stage_id, w->lane_id,
-        w->disk->traddr, w->disk->sector_size);
+    if (stage_worker_alloc_qpair(w) != 0) {
         return NULL;
     }
-
-    /*
-     * 可调深度的多缓冲：
-     *   1. 先尽量把读请求提交到 read_depth
-     *   2. completion 到来后先进入本 worker 的 ready queue
-     *   3. 按 ready queue 消费已完成 run，而不是按提交顺序阻塞等待 head
-     */
-    const uint32_t read_depth = app->read_depth;
-    const size_t buf_bytes = (size_t)w->disk->sector_size * MAX_BATCH;
-    uint32_t max_bundles_per_read = spdk_nvme_ns_get_max_io_xfer_size(w->disk->ns) / w->disk->sector_size;
-    if (max_bundles_per_read == 0) {
-        max_bundles_per_read = 1;
-    }
-    if (app->max_read_lbas > 0 && app->max_read_lbas < max_bundles_per_read) {
-        max_bundles_per_read = app->max_read_lbas;
-    }
-    if (w->stage_id == 0 &&
-        app->stage0_max_read_lbas > 0 &&
-        app->stage0_max_read_lbas < max_bundles_per_read) {
-        max_bundles_per_read = app->stage0_max_read_lbas;
-    }
-    if (max_bundles_per_read > MAX_BATCH) {
-        max_bundles_per_read = MAX_BATCH;
-    }
-
-    void **read_bufs = calloc(read_depth, sizeof(*read_bufs));
-    struct bundle_run *run_slots = calloc(read_depth, sizeof(*run_slots));
-    uint16_t *ready_slots = calloc(read_depth, sizeof(*ready_slots));
-    if (!read_bufs || !run_slots || !ready_slots) {
-        fprintf(stderr,
-                "worker=%d failed to allocate read-depth state depth=%u\n",
-                w->worker_id,
-                read_depth);
-        free(ready_slots);
-        free(run_slots);
-        free(read_bufs);
-        spdk_nvme_ctrlr_free_io_qpair(w->qpair);
-        w->qpair = NULL;
+    if (stage_worker_init_io_state(w, &io) != 0) {
+        stage_worker_cleanup_io_state(w, &io);
         return NULL;
-    }
-
-    for (uint32_t i = 0; i < read_depth; i++) {
-        read_bufs[i] = spdk_zmalloc(
-            buf_bytes,
-            4096,
-            NULL,
-            SPDK_ENV_NUMA_ID_ANY,
-            SPDK_MALLOC_DMA
-        );
-        if (!read_bufs[i]) {
-            fprintf(stderr,
-                    "spdk_zmalloc failed worker=%d read_buf[%u] depth=%u\n",
-                    w->worker_id,
-                    i,
-                    read_depth);
-            for (uint32_t j = 0; j < i; j++) {
-                spdk_free(read_bufs[j]);
-            }
-            free(ready_slots);
-            free(run_slots);
-            free(read_bufs);
-            spdk_nvme_ctrlr_free_io_qpair(w->qpair);
-            w->qpair = NULL;
-            return NULL;
-        }
     }
 
     while (1) {
@@ -1060,289 +1122,23 @@ static void *stage_worker_main(void *arg) {
             abort();
         }
 
-        /*
-         * 申请out，它是要发给下一个stage的新batch
-         */
-        batch_t *out = alloc_stage_out_batch(in->qid, in->stage + 1);
-
-        // 从query_tracker_t里面读出query和该query的动态阈值
-        const float *query_seg = NULL;
-        float prune_threshold = app->threshold;
-        pthread_mutex_lock(&app->query_mu);
-        query_tracker_t *qt_for_query = find_query_tracker_locked(app, in->qid);
-        if (qt_for_query) {
-            query_seg = qt_for_query->query_segs[w->stage_id];
-            if (qt_for_query->prune_threshold > 0.0f) {
-                prune_threshold = qt_for_query->prune_threshold;
-            }
-        }
-        pthread_mutex_unlock(&app->query_mu);
-
-        if (!query_seg) {
-            fprintf(stderr,
-                    "[stage %d lane %d] query seg not found for qid=%lu\n",
-                    w->stage_id, w->lane_id, in->qid);
-            free(out);
-            free(in);
-            continue;
-        }
-
-
-        /* batch内profile */
-        uint64_t batch_begin_us = now_us();
-        uint64_t batch_qsort_us = 0;
-        uint64_t batch_io_us = 0;
-        uint32_t batch_in = in->count;
-        uint32_t batch_pruned = 0;
-        uint32_t batch_out = 0;              /* 统一定义为本 stage 保留下来的数量 */
-        uint32_t child_batches = 0;
-        uint32_t batch_bundles_read = 0;
-        uint32_t batch_nvme_reads = 0;
-        uint64_t batch_nvme_read_bytes = 0;
-        cand_item_t bundle_items[MAX_BATCH];
-        uint16_t bundle_item_count = 0;
-        uint32_t current_bundle_cluster = UINT32_MAX;
-        uint32_t current_bundle_idx = UINT32_MAX;
-
-        if (in->count > 1) {
-            uint64_t qsort_begin_us = now_us();
-            tls_vectors_per_lba_for_sort = app->ivf_meta.header.vectors_per_lba;
-            qsort(in->items, in->count, sizeof(in->items[0]), cmp_cand_item_by_bundle);
-            batch_qsort_us += now_us() - qsort_begin_us;
-        }
-
-        // -------- 优化版本：按LBA分批读 --------
-        // -------- 没加向量计算并行，后续再加 -------
-        const uint32_t vectors_per_lba = app->ivf_meta.header.vectors_per_lba;
-        const uint32_t stage_dim = app->ivf_meta.header.shard_dims[w->stage_id];
-        const uint32_t shard_bytes = app->ivf_meta.header.shard_bytes[w->stage_id];
-        const uint32_t max_gap_bundles = (w->stage_id == 0)
-                                             ? app->stage0_gap_merge_limit
-                                             : app->stage1_gap_merge_limit;
-
-        if (in->count > 0) {
-            uint16_t next_idx = 0;
-            uint32_t inflight = 0;
-            uint32_t ready_head = 0;
-            uint32_t ready_tail = 0;
-            uint32_t ready_count = 0;
-
-            while (next_idx < in->count || inflight > 0 || ready_count > 0) {
-                for (uint32_t slot_idx = 0;
-                     next_idx < in->count && inflight < read_depth && slot_idx < read_depth;
-                     slot_idx++) {
-                    struct bundle_run *slot = &run_slots[slot_idx];
-                    if (slot->submitted) {
-                        continue;
-                    }
-                    if (!plan_bundle_run(in,
-                                         next_idx,
-                                         vectors_per_lba,
-                                         max_bundles_per_read,
-                                         max_gap_bundles,
-                                         read_bufs[slot_idx],
-                                         slot)) {
-                        next_idx = in->count;
-                        break;
-                    }
-                    slot->submit_rc = submit_vec_bundle_range(w, slot);
-                    if (slot->submit_rc == 0) {
-                        batch_nvme_reads++;
-                        batch_nvme_read_bytes += (uint64_t)slot->bundle_count * (uint64_t)w->disk->sector_size;
-                    } else {
-                        slot->submitted = false;
-                    }
-                    next_idx = slot->end_idx;
-                    inflight++;
-                }
-
-                if (ready_count == 0 && inflight > 0) {
-                    int collect_rc = collect_completed_runs(w,
-                                                           run_slots,
-                                                           read_depth,
-                                                           ready_slots,
-                                                           &ready_tail,
-                                                           &ready_count);
-                    if (collect_rc != 0) {
-                        fprintf(stderr,
-                                "[stage %d] process completions failed rc=%d disk=%s\n",
-                                w->stage_id,
-                                collect_rc,
-                                w->disk->traddr);
-                        break;
-                    }
-                    if (ready_count == 0) {
-                        continue;
-                    }
-                }
-
-                if (ready_count == 0) {
-                    continue;
-                }
-
-                uint16_t slot_idx = ready_slots[ready_head];
-                ready_head = (ready_head + 1) % read_depth;
-                ready_count--;
-
-                struct bundle_run *cur_run = &run_slots[slot_idx];
-                uint64_t run_io_us = cur_run->complete_us > cur_run->submit_us
-                                         ? (cur_run->complete_us - cur_run->submit_us)
-                                         : 0;
-                int cur_io_rc = cur_run->submit_rc;
-
-                batch_io_us += run_io_us;
-                if (cur_io_rc == 0 && cur_run->waiter.ok) {
-                    batch_bundles_read += cur_run->bundle_count;
-                } else if (cur_io_rc == 0) {
-                    cur_io_rc = -1;
-                }
-
-                if (cur_io_rc != 0) {
-                    fprintf(stderr,
-                            "[stage %d] merged bundle read failed cluster=%u start_bundle=%u bundle_count=%u disk=%s\n",
-                            w->stage_id,
-                            cur_run->cluster_id,
-                            cur_run->start_bundle,
-                            cur_run->bundle_count,
-                            w->disk->traddr);
-                } else {
-                    for (uint16_t k = cur_run->begin_idx; k < cur_run->end_idx; k++) {
-                        uint32_t vec_id = in->items[k].vec_id;
-                        uint32_t cluster_id = in->items[k].cluster_id;
-                        uint32_t local_idx = in->items[k].local_idx;
-                        float acc = in->items[k].partial_sum;
-
-                        uint32_t bundle_idx = local_idx / vectors_per_lba;
-                        uint32_t lane_idx = local_idx % vectors_per_lba;
-                        uint32_t bundle_offset = bundle_idx - cur_run->start_bundle;
-
-                        float *seg = (float *)((uint8_t *)cur_run->buf +
-                                               (size_t)bundle_offset * w->disk->sector_size +
-                                               (size_t)lane_idx * shard_bytes);
-
-                        float part = partial_l2(seg, query_seg, stage_dim);
-                        acc += part;
-
-                        if (acc > prune_threshold) {
-                            batch_pruned++;
-                            continue;
-                        }
-                        batch_out++;
-
-                        if (current_bundle_cluster != cluster_id || current_bundle_idx != bundle_idx) {
-                            out = append_bundle_group_to_out(app, out, bundle_items, bundle_item_count, &child_batches);
-                            bundle_item_count = 0;
-                            current_bundle_cluster = cluster_id;
-                            current_bundle_idx = bundle_idx;
-                        }
-
-                        bundle_items[bundle_item_count].vec_id = vec_id;
-                        bundle_items[bundle_item_count].cluster_id = cluster_id;
-                        bundle_items[bundle_item_count].local_idx = local_idx;
-                        bundle_items[bundle_item_count].partial_sum = acc;
-                        bundle_item_count++;
-                    }
-                }
-
-                inflight--;
-                cur_run->submitted = false;
-                cur_run->completion_seen = false;
-            }
-        }
-
-        /* 扫完输入 batch 后，把剩余 surviving batch 发出去 */
-        out = append_bundle_group_to_out(app, out, bundle_items, bundle_item_count, &child_batches);
-
-        if (w->stage_id != NUM_STAGES - 1) {
-            if (out->count > 0) {
-                emit_out_batch(app, out, &child_batches);
-            } else {
-                free(out);
-            }
-        } else {
-            if (out->count > 0) {
-                emit_out_batch(app, out, &child_batches);
-            } else {
-                free(out);
-            }
-        }
-
-        uint64_t batch_wall_us = now_us() - batch_begin_us;
-
-        __atomic_fetch_add(&app->stage_in[w->stage_id], batch_in, __ATOMIC_RELAXED);
-        __atomic_fetch_add(&app->stage_out[w->stage_id], batch_out, __ATOMIC_RELAXED);
-        __atomic_fetch_add(&app->stage_pruned[w->stage_id], batch_pruned, __ATOMIC_RELAXED);
-
-        /* 先更新 per-query profiling */
-        pthread_mutex_lock(&app->query_mu);
-        query_tracker_t *qt = find_query_tracker_locked(app, in->qid);
-        if (qt) {
-            qt->stage_in[w->stage_id] += batch_in;
-            qt->stage_out[w->stage_id] += batch_out;
-            qt->stage_pruned[w->stage_id] += batch_pruned;
-            qt->stage_batches[w->stage_id] += 1;
-            qt->stage_bundles_read[w->stage_id] += batch_bundles_read;
-            qt->stage_nvme_reads[w->stage_id] += batch_nvme_reads;
-            qt->stage_nvme_read_bytes[w->stage_id] += batch_nvme_read_bytes;
-            qt->stage_wall_us[w->stage_id] += batch_wall_us;
-            qt->stage_io_us[w->stage_id] += batch_io_us;
-            qt->stage_qsort_us[w->stage_id] += batch_qsort_us;
-        }
-        pthread_mutex_unlock(&app->query_mu);
-
-        /* 再结束这个 batch 的生命周期 */
-        mark_batch_finished(app, in->qid, child_batches);
-
-        free(in);
+        stage_worker_process_batch(w, in, &io);
     }
 
-    for (uint32_t i = 0; i < read_depth; i++) {
-        spdk_free(read_bufs[i]);
-    }
-    free(ready_slots);
-    free(run_slots);
-    free(read_bufs);
-    spdk_nvme_ctrlr_free_io_qpair(w->qpair);
-    w->qpair = NULL;
+    stage_worker_cleanup_io_state(w, &io);
     return NULL;
 }
 
-/* ============================================================
- * 8. pipeline_init
- *
- * main.c 需要先准备好：
- *   disks[i].ctrlr
- *   disks[i].ns
- *   disks[i].sector_size
- *
- *   - 把已经 probe 好的 disks 拷贝进 app
- *   - 保存 query / threshold
- *   - 初始化各 worker 的配置和队列
- * ============================================================ */
-
-int pipeline_init(
-    pipeline_app_t *app,
-    disk_ctx_t disks[NUM_STAGES],
-    const uint32_t stage_worker_counts[NUM_STAGES],
-    const int stage_cores[NUM_STAGES][MAX_WORKERS_PER_STAGE],
-    int topk_core,
-    uint32_t read_depth,
-    uint32_t stage1_gap_merge_limit,
-    uint32_t stage0_gap_merge_limit,
-    uint32_t stage0_max_read_lbas,
-    uint32_t active_stages,
-    const char *coarse_backend_name_arg,
-    const char *prune_threshold_mode_name_arg,
-    float threshold,
-    const char *ivf_meta_path,
-    const char *sorted_ids_path
-)
+static int pipeline_validate_init_args(uint32_t read_depth,
+                                       uint32_t stage1_gap_merge_limit,
+                                       uint32_t stage0_gap_merge_limit,
+                                       uint32_t stage0_max_read_lbas,
+                                       uint32_t active_stages,
+                                       coarse_backend_t backend,
+                                       prune_threshold_mode_t prune_mode,
+                                       const char *coarse_backend_name_arg,
+                                       const char *prune_threshold_mode_name_arg)
 {
-    coarse_backend_t backend = parse_coarse_backend_name(coarse_backend_name_arg);
-    prune_threshold_mode_t prune_mode = parse_prune_threshold_mode_name(prune_threshold_mode_name_arg);
-
-    memset(app, 0, sizeof(*app));
-
     if (read_depth == 0 || read_depth > MAX_BATCH) {
         fprintf(stderr,
                 "pipeline_init: invalid read depth=%u valid_range=[1,%d]\n",
@@ -1385,6 +1181,179 @@ int pipeline_init(
         return -1;
     }
 
+    return 0;
+}
+
+static int pipeline_copy_disk_ctxs(pipeline_app_t *app, disk_ctx_t disks[NUM_STAGES])
+{
+    for (int i = 0; i < NUM_STAGES; i++) {
+        app->disks[i] = disks[i];
+        if (!app->disks[i].ctrlr || !app->disks[i].ns) {
+            fprintf(stderr, "pipeline_init: disk %d not initialized (traddr=%s)\n",
+                    i, app->disks[i].traddr);
+            return -1;
+        }
+    }
+
+    return 0;
+}
+
+static void pipeline_assign_runtime_config(pipeline_app_t *app,
+                                           float threshold,
+                                           uint32_t read_depth,
+                                           uint32_t stage1_gap_merge_limit,
+                                           uint32_t stage0_gap_merge_limit,
+                                           uint32_t stage0_max_read_lbas,
+                                           uint32_t active_stages,
+                                           coarse_backend_t backend,
+                                           prune_threshold_mode_t prune_mode)
+{
+    app->threshold = threshold;
+    app->read_depth = read_depth;
+    app->stage1_gap_merge_limit = stage1_gap_merge_limit;
+    app->stage0_gap_merge_limit = stage0_gap_merge_limit;
+    app->stage0_max_read_lbas = stage0_max_read_lbas;
+    app->active_stages = active_stages;
+    app->coarse_backend = backend;
+    app->prune_threshold_mode = prune_mode;
+}
+
+static int pipeline_check_meta_compatibility(pipeline_app_t *app)
+{
+    for (int s = 0; s < NUM_STAGES; s++) {
+        if (app->disks[s].sector_size != app->ivf_meta.header.sector_size) {
+            fprintf(stderr,
+                    "pipeline_init: sector size mismatch stage=%d disk=%u meta=%u\n",
+                    s,
+                    app->disks[s].sector_size,
+                    app->ivf_meta.header.sector_size);
+            return -1;
+        }
+        if (app->ivf_meta.header.shard_bytes[s] > app->disks[s].sector_size) {
+            fprintf(stderr,
+                    "pipeline_init: shard bytes exceed sector size stage=%d shard_bytes=%u sector=%u\n",
+                    s,
+                    app->ivf_meta.header.shard_bytes[s],
+                    app->disks[s].sector_size);
+            return -1;
+        }
+    }
+
+    return 0;
+}
+
+static void pipeline_cleanup_init_state(pipeline_app_t *app, bool destroy_query_mu)
+{
+    free(app->sorted_vec_ids);
+    app->sorted_vec_ids = NULL;
+    app->num_sorted_vec_ids = 0;
+
+    free(app->prune_sample_vectors);
+    app->prune_sample_vectors = NULL;
+    app->prune_sample_count = 0;
+
+    coarse_search_module_destroy(app->coarse_module);
+    app->coarse_module = NULL;
+
+    free_ivf_meta(&app->ivf_meta);
+    app->centroids = NULL;
+    app->nlist = 0;
+
+    if (destroy_query_mu) {
+        pthread_mutex_destroy(&app->query_mu);
+    }
+}
+
+static int pipeline_init_workers(pipeline_app_t *app,
+                                 const uint32_t stage_worker_counts[NUM_STAGES],
+                                 const int stage_cores[NUM_STAGES][MAX_WORKERS_PER_STAGE],
+                                 int topk_core)
+{
+    pthread_mutex_init(&app->query_mu, NULL);
+    memset(app->queries, 0, sizeof(app->queries));
+
+    queue_init(&app->topk.inq);
+    app->topk.app = app;
+    app->topk.core_id = topk_core;
+
+    int worker_id = 0;
+    for (int s = 0; s < NUM_STAGES; s++) {
+        uint32_t worker_count = stage_worker_counts[s];
+        if (worker_count == 0 || worker_count > MAX_WORKERS_PER_STAGE) {
+            fprintf(stderr,
+                    "pipeline_init: invalid worker count stage=%d count=%u max=%d\n",
+                    s, worker_count, MAX_WORKERS_PER_STAGE);
+            return -1;
+        }
+
+        app->stage_worker_counts[s] = worker_count;
+        app->stage_rr_cursor[s] = 0;
+
+        for (uint32_t lane = 0; lane < worker_count; lane++) {
+            stage_worker_t *w = &app->workers[s][lane];
+            w->app = app;
+            w->worker_id = worker_id++;
+            w->stage_id = s;
+            w->lane_id = (int)lane;
+            w->core_id = stage_cores[s][lane];
+            w->disk = &app->disks[s];
+            w->qpair = NULL;
+            queue_init(&w->inq);
+        }
+    }
+
+    return 0;
+}
+
+/* ============================================================
+ * 8. pipeline_init
+ *
+ * main.c 需要先准备好：
+ *   disks[i].ctrlr
+ *   disks[i].ns
+ *   disks[i].sector_size
+ *
+ *   - 把已经 probe 好的 disks 拷贝进 app
+ *   - 保存 query / threshold
+ *   - 初始化各 worker 的配置和队列
+ * ============================================================ */
+
+int pipeline_init(
+    pipeline_app_t *app,
+    disk_ctx_t disks[NUM_STAGES],
+    const uint32_t stage_worker_counts[NUM_STAGES],
+    const int stage_cores[NUM_STAGES][MAX_WORKERS_PER_STAGE],
+    int topk_core,
+    uint32_t read_depth,
+    uint32_t stage1_gap_merge_limit,
+    uint32_t stage0_gap_merge_limit,
+    uint32_t stage0_max_read_lbas,
+    uint32_t active_stages,
+    const char *coarse_backend_name_arg,
+    const char *prune_threshold_mode_name_arg,
+    float threshold,
+    const char *ivf_meta_path,
+    const char *sorted_ids_path
+)
+{
+    coarse_backend_t backend = parse_coarse_backend_name(coarse_backend_name_arg);
+    prune_threshold_mode_t prune_mode = parse_prune_threshold_mode_name(prune_threshold_mode_name_arg);
+    bool query_mu_initialized = false;
+
+    memset(app, 0, sizeof(*app));
+
+    if (pipeline_validate_init_args(read_depth,
+                                    stage1_gap_merge_limit,
+                                    stage0_gap_merge_limit,
+                                    stage0_max_read_lbas,
+                                    active_stages,
+                                    backend,
+                                    prune_mode,
+                                    coarse_backend_name_arg,
+                                    prune_threshold_mode_name_arg) != 0) {
+        return -1;
+    }
+
     fprintf(stderr,
             "[pipeline_init] begin read_depth=%u stage0_gap_merge_limit=%u stage1_gap_merge_limit=%u stage0_max_read_lbas=%u active_stages=%u coarse_backend=%s prune_threshold_mode=%s ivf_meta=%s sorted_ids=%s\n",
             read_depth,
@@ -1397,29 +1366,24 @@ int pipeline_init(
             ivf_meta_path ? ivf_meta_path : "(null)",
             sorted_ids_path ? sorted_ids_path : "(null)");
 
-    for (int i = 0; i < NUM_STAGES; i++) {
-        app->disks[i] = disks[i];
-
-        if (!app->disks[i].ctrlr || !app->disks[i].ns) {
-            fprintf(stderr, "pipeline_init: disk %d not initialized (traddr=%s)\n",
-                    i, app->disks[i].traddr);
-            return -1;
-        }
+    if (pipeline_copy_disk_ctxs(app, disks) != 0) {
+        return -1;
     }
 
-    app->threshold = threshold;
-    app->read_depth = read_depth;
-    app->stage1_gap_merge_limit = stage1_gap_merge_limit;
-    app->stage0_gap_merge_limit = stage0_gap_merge_limit;
-    app->stage0_max_read_lbas = stage0_max_read_lbas;
-    app->active_stages = active_stages;
-    app->coarse_backend = backend;
-    app->prune_threshold_mode = prune_mode;
+    pipeline_assign_runtime_config(app,
+                                   threshold,
+                                   read_depth,
+                                   stage1_gap_merge_limit,
+                                   stage0_gap_merge_limit,
+                                   stage0_max_read_lbas,
+                                   active_stages,
+                                   backend,
+                                   prune_mode);
 
     fprintf(stderr, "[pipeline_init] before parse_ivf_meta\n");
     if (parse_ivf_meta(ivf_meta_path, &app->ivf_meta) != 0) {
         fprintf(stderr, "pipeline_init: failed to load ivf meta from %s\n", ivf_meta_path);
-        return -1;
+        goto fail;
     }
 
     app->nlist = app->ivf_meta.nlist;
@@ -1440,10 +1404,7 @@ int pipeline_init(
                                       app->ivf_meta.header.dim,
                                       app->nlist) != 0) {
             fprintf(stderr, "pipeline_init: failed to build Faiss coarse index\n");
-            free_ivf_meta(&app->ivf_meta);
-            app->centroids = NULL;
-            app->nlist = 0;
-            return -1;
+            goto fail;
         }
         fprintf(stderr, "[pipeline_init] after coarse_search_module_init\n");
     } else {
@@ -1451,44 +1412,14 @@ int pipeline_init(
         fprintf(stderr, "[pipeline_init] skip coarse_search_module_init for brute backend\n");
     }
 
-    for (int s = 0; s < NUM_STAGES; s++) {
-        if (app->disks[s].sector_size != app->ivf_meta.header.sector_size) {
-            fprintf(stderr,
-                    "pipeline_init: sector size mismatch stage=%d disk=%u meta=%u\n",
-                    s,
-                    app->disks[s].sector_size,
-                    app->ivf_meta.header.sector_size);
-            coarse_search_module_destroy(app->coarse_module);
-            app->coarse_module = NULL;
-            free_ivf_meta(&app->ivf_meta);
-            app->centroids = NULL;
-            app->nlist = 0;
-            return -1;
-        }
-        if (app->ivf_meta.header.shard_bytes[s] > app->disks[s].sector_size) {
-            fprintf(stderr,
-                    "pipeline_init: shard bytes exceed sector size stage=%d shard_bytes=%u sector=%u\n",
-                    s,
-                    app->ivf_meta.header.shard_bytes[s],
-                    app->disks[s].sector_size);
-            coarse_search_module_destroy(app->coarse_module);
-            app->coarse_module = NULL;
-            free_ivf_meta(&app->ivf_meta);
-            app->centroids = NULL;
-            app->nlist = 0;
-            return -1;
-        }
+    if (pipeline_check_meta_compatibility(app) != 0) {
+        goto fail;
     }
 
     fprintf(stderr, "[pipeline_init] before load_sorted_ids_bin\n");
     if (load_sorted_ids_bin(sorted_ids_path, &app->num_sorted_vec_ids, &app->sorted_vec_ids) != 0) {
         fprintf(stderr, "pipeline_init: failed to load sorted ids from %s\n", sorted_ids_path);
-        coarse_search_module_destroy(app->coarse_module);
-        app->coarse_module = NULL;
-        free_ivf_meta(&app->ivf_meta);
-        app->centroids = NULL;
-        app->nlist = 0;
-        return -1;
+        goto fail;
     }
     fprintf(stderr,
             "[pipeline_init] after load_sorted_ids_bin count=%u expected=%u\n",
@@ -1499,30 +1430,14 @@ int pipeline_init(
         fprintf(stderr,
                 "pipeline_init: sorted ids count mismatch got=%u expected=%u\n",
                 app->num_sorted_vec_ids, app->ivf_meta.header.num_vectors);
-        free(app->sorted_vec_ids);
-        app->sorted_vec_ids = NULL;
-        app->num_sorted_vec_ids = 0;
-        coarse_search_module_destroy(app->coarse_module);
-        app->coarse_module = NULL;
-        free_ivf_meta(&app->ivf_meta);
-        app->centroids = NULL;
-        app->nlist = 0;
-        return -1;
+        goto fail;
     }
 
     if (app->prune_threshold_mode == PRUNE_THRESHOLD_SAMPLED) {
         fprintf(stderr, "[pipeline_init] before build_prune_sample_vectors\n");
         if (build_prune_sample_vectors(app) != 0) {
             fprintf(stderr, "pipeline_init: failed to build prune sample vectors\n");
-            free(app->sorted_vec_ids);
-            app->sorted_vec_ids = NULL;
-            app->num_sorted_vec_ids = 0;
-            coarse_search_module_destroy(app->coarse_module);
-            app->coarse_module = NULL;
-            free_ivf_meta(&app->ivf_meta);
-            app->centroids = NULL;
-            app->nlist = 0;
-            return -1;
+            goto fail;
         }
         fprintf(stderr, "[pipeline_init] after build_prune_sample_vectors sample_count=%u topk=%u\n",
                 app->prune_sample_count, PRUNE_SAMPLE_TOPK);
@@ -1531,53 +1446,18 @@ int pipeline_init(
     }
 
     fprintf(stderr, "[pipeline_init] before worker setup\n");
-    pthread_mutex_init(&app->query_mu, NULL);
-    memset(app->queries, 0, sizeof(app->queries));
-
-    queue_init(&app->topk.inq);
-    app->topk.app = app;
-    app->topk.core_id = topk_core;
-
-    int worker_id = 0;
-    for (int s = 0; s < NUM_STAGES; s++) {
-        uint32_t worker_count = stage_worker_counts[s];
-        if (worker_count == 0 || worker_count > MAX_WORKERS_PER_STAGE) {
-            fprintf(stderr,
-                    "pipeline_init: invalid worker count stage=%d count=%u max=%d\n",
-                    s, worker_count, MAX_WORKERS_PER_STAGE);
-            free(app->sorted_vec_ids);
-            app->sorted_vec_ids = NULL;
-            app->num_sorted_vec_ids = 0;
-            free(app->prune_sample_vectors);
-            app->prune_sample_vectors = NULL;
-            app->prune_sample_count = 0;
-            coarse_search_module_destroy(app->coarse_module);
-            app->coarse_module = NULL;
-            free_ivf_meta(&app->ivf_meta);
-            app->centroids = NULL;
-            app->nlist = 0;
-            pthread_mutex_destroy(&app->query_mu);
-            return -1;
-        }
-
-        app->stage_worker_counts[s] = worker_count;
-        app->stage_rr_cursor[s] = 0;
-
-        for (uint32_t lane = 0; lane < worker_count; lane++) {
-            stage_worker_t *w = &app->workers[s][lane];
-            w->app = app;
-            w->worker_id = worker_id++;
-            w->stage_id = s;
-            w->lane_id = (int)lane;
-            w->core_id = stage_cores[s][lane];
-            w->disk = &app->disks[s];
-            w->qpair = NULL;
-            queue_init(&w->inq);
-        }
+    if (pipeline_init_workers(app, stage_worker_counts, stage_cores, topk_core) != 0) {
+        query_mu_initialized = true;
+        goto fail;
     }
+    query_mu_initialized = true;
 
     fprintf(stderr, "[pipeline_init] done\n");
     return 0;
+
+fail:
+    pipeline_cleanup_init_state(app, query_mu_initialized);
+    return -1;
 }
 
 /* ============================================================
@@ -1652,7 +1532,7 @@ void pipeline_destroy(pipeline_app_t *app) {
     if (!app) return;
 
     for (uint32_t i = 0; i < MAX_QUERIES_IN_FLIGHT; i++) {
-        free_query_tracker_segments(&app->queries[i]);
+        pipeline_free_query_tracker_segments(&app->queries[i]);
     }
 
     coarse_search_module_destroy(app->coarse_module);
@@ -1685,120 +1565,6 @@ void pipeline_destroy(pipeline_app_t *app) {
  * 14.query helper
  * ============================================================ */
 // 注册一个新的 query，初始化query_tracker_t并返回其指针
-query_tracker_t *register_query(pipeline_app_t *app,
-                                uint64_t qid,
-                                uint32_t nprobe,
-                                uint32_t num_probed_clusters)
-{
-    if (!app || qid == 0) {
-        return NULL;
-    }
-
-    pthread_mutex_lock(&app->query_mu);
-
-    /* 先防重复 qid */
-    for (uint32_t i = 0; i < MAX_QUERIES_IN_FLIGHT; i++) {
-        if (app->queries[i].qid == qid) {
-            pthread_mutex_unlock(&app->query_mu);
-            fprintf(stderr, "register_query: duplicate qid=%lu\n", qid);
-            return NULL;
-        }
-    }
-
-    /* 找空槽 */
-    for (uint32_t i = 0; i < MAX_QUERIES_IN_FLIGHT; i++) {
-        if (app->queries[i].qid == 0) {
-            query_tracker_t *qt = &app->queries[i];
-            memset(qt, 0, sizeof(*qt));
-
-            qt->qid = qid;
-            qt->nprobe = nprobe;
-            qt->num_probed_clusters = num_probed_clusters;
-            qt->initial_candidates = 0;
-            qt->submitted_batches = 0;
-            qt->completed_batches = 0;
-            qt->outstanding_batches = 0;
-            qt->max_outstanding_batches = 0;
-            qt->submission_done = false;
-            qt->done = false;
-            qt->prune_threshold = 0.0f;
-            qt->coarse_search_us = 0;
-            qt->submit_candidates_us = 0;
-            memset(qt->stage_in, 0, sizeof(qt->stage_in));
-            memset(qt->stage_out, 0, sizeof(qt->stage_out));
-            memset(qt->stage_pruned, 0, sizeof(qt->stage_pruned));
-            memset(qt->stage_batches, 0, sizeof(qt->stage_batches));
-            memset(qt->stage_bundles_read, 0, sizeof(qt->stage_bundles_read));
-            memset(qt->stage_wall_us, 0, sizeof(qt->stage_wall_us));
-            memset(qt->stage_io_us, 0, sizeof(qt->stage_io_us));
-            memset(qt->stage_qsort_us, 0, sizeof(qt->stage_qsort_us));
-            qt->topk_batches = 0;
-            qt->topk_items = 0;
-            qt->topk_wall_us = 0;
-            memset(&qt->query_topk, 0, sizeof(qt->query_topk));
-
-            for (int s = 0; s < NUM_STAGES; s++) {
-                uint32_t seg_dim = app->ivf_meta.header.shard_dims[s];
-                qt->query_segs[s] = (float *)calloc(seg_dim, sizeof(float));
-                if (!qt->query_segs[s]) {
-                    perror("calloc query_seg");
-                    free_query_tracker_segments(qt);
-                    memset(qt, 0, sizeof(*qt));
-                    pthread_mutex_unlock(&app->query_mu);
-                    return NULL;
-                }
-            }
-
-            qt->submit_ts_us = now_us();
-            qt->done_ts_us = 0;
-
-            pthread_mutex_unlock(&app->query_mu);
-            return qt;
-        }
-    }
-
-    pthread_mutex_unlock(&app->query_mu);
-    fprintf(stderr, "register_query: no free query slot\n");
-    return NULL;
-}
-
-// 一个 work item 完成后调用一次；spawned_batches 表示它向下游新产生了多少 batch
-void mark_batch_finished(pipeline_app_t *app, uint64_t qid, uint32_t spawned_batches)
-{
-    if (!app || qid == 0) {
-        return;
-    }
-
-    pthread_mutex_lock(&app->query_mu);
-
-    for (uint32_t i = 0; i < MAX_QUERIES_IN_FLIGHT; i++) {
-        query_tracker_t *qt = &app->queries[i];
-        if (qt->qid == qid) {
-            qt->completed_batches++;
-
-            if (qt->outstanding_batches == 0) {
-                pthread_mutex_unlock(&app->query_mu);
-                fprintf(stderr, "mark_batch_finished: qid=%lu outstanding underflow\n", qid);
-                return;
-            }
-
-            qt->outstanding_batches = qt->outstanding_batches - 1 + spawned_batches;
-            if (qt->outstanding_batches > qt->max_outstanding_batches) {
-                qt->max_outstanding_batches = qt->outstanding_batches;
-            }
-
-            maybe_mark_query_done_locked(qt);
-
-            pthread_mutex_unlock(&app->query_mu);
-            return;
-        }
-    }
-
-    pthread_mutex_unlock(&app->query_mu);
-    fprintf(stderr, "mark_batch_finished: qid=%lu not found\n", qid);
-}
-
-
 // 暴力搜top nprobe个聚类
 int coarse_search_topn(const float *query,
                        const float *centroids,
@@ -1845,43 +1611,6 @@ int coarse_search_topn(const float *query,
     }
 
     return 0;
-}
-
-// 等待query结束
-int wait_query_done(pipeline_app_t *app, uint64_t qid, uint32_t timeout_ms)
-{
-    if (!app || qid == 0) {
-        return -1;
-    }
-
-    const uint32_t sleep_us = 1000; /* 1ms */
-    uint32_t waited_ms = 0;
-
-    while (timeout_ms == 0 || waited_ms < timeout_ms) {
-        pthread_mutex_lock(&app->query_mu);
-
-        for (uint32_t i = 0; i < MAX_QUERIES_IN_FLIGHT; i++) {
-            query_tracker_t *qt = &app->queries[i];
-            if (qt->qid == qid) {
-                bool done = qt->done;
-                pthread_mutex_unlock(&app->query_mu);
-                if (done) {
-                    return 0;
-                }
-                goto not_done;
-            }
-        }
-
-        pthread_mutex_unlock(&app->query_mu);
-        fprintf(stderr, "wait_query_done: qid=%lu not found\n", qid);
-        return -1;
-
-not_done:
-        usleep(sleep_us);
-        waited_ms += 1;
-    }
-
-    return 1; /* timeout */
 }
 
 // 把一个cluster里面的candidate切成batches
@@ -2100,7 +1829,7 @@ int submit_query(pipeline_app_t *app,
         if (x->qid == qid) {
             uint32_t submitted = x->submitted_batches;
             x->submission_done = true;
-            maybe_mark_query_done_locked(x);
+            pipeline_maybe_mark_query_done_locked(x);
             pthread_mutex_unlock(&app->query_mu);
             if (submitted == 0) {
                 fprintf(stderr, "submit_query: qid=%lu submitted_batches=0\n", qid);
