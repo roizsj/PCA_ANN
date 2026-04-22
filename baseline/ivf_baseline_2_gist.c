@@ -2,6 +2,7 @@
 #include <spdk/env.h>
 #include <spdk/nvme.h>
 
+#include "coarse_search_module.h"
 #include "query_loader.h"
 
 #include <errno.h>
@@ -109,6 +110,7 @@ typedef struct {
     const char *pca_meta_path;
     const char *disk_traddr;
     const char *cores_spec;
+    const char *coarse_backend;
     uint32_t nprobe;
     uint32_t max_queries;
     uint32_t threads;
@@ -149,6 +151,11 @@ typedef struct {
     uint8_t *dma_buf;
     size_t dma_bytes;
     CoarseHit *hits_buf;
+    uint32_t *coarse_labels_buf;
+    float *coarse_distances_buf;
+    const coarse_search_module_t *coarse_module;
+    pthread_mutex_t *coarse_mu;
+    bool use_faiss_coarse;
     uint32_t nprobe;
     uint32_t max_queries;
     const IvfMeta *meta;
@@ -547,6 +554,39 @@ static int coarse_search_topn(const float *query, const IvfMeta *meta, uint32_t 
     return 0;
 }
 
+static int coarse_search_worker(QueryWorker *worker, const float *query)
+{
+    if (!worker || !query || !worker->hits_buf) {
+        return -1;
+    }
+
+    if (!worker->use_faiss_coarse) {
+        return coarse_search_topn(query, worker->meta, worker->nprobe, worker->hits_buf);
+    }
+
+    if (!worker->coarse_module || !worker->coarse_labels_buf || !worker->coarse_distances_buf ||
+        !worker->coarse_mu) {
+        return -1;
+    }
+
+    pthread_mutex_lock(worker->coarse_mu);
+    int rc = coarse_search_module_search(worker->coarse_module,
+                                         query,
+                                         worker->nprobe,
+                                         worker->coarse_labels_buf,
+                                         worker->coarse_distances_buf);
+    pthread_mutex_unlock(worker->coarse_mu);
+    if (rc != 0) {
+        return rc;
+    }
+
+    for (uint32_t i = 0; i < worker->nprobe; i++) {
+        worker->hits_buf[i].cluster_id = worker->coarse_labels_buf[i];
+        worker->hits_buf[i].dist = worker->coarse_distances_buf[i];
+    }
+    return 0;
+}
+
 static bool probe_cb(void *cb_ctx,
                      const struct spdk_nvme_transport_id *trid,
                      struct spdk_nvme_ctrlr_opts *opts)
@@ -734,8 +774,8 @@ static int run_single_query(QueryWorker *worker, uint32_t query_idx)
 
     uint64_t total_begin_us = now_us();
     uint64_t coarse_begin_us = now_us();
-    if (coarse_search_topn(query, worker->meta, worker->nprobe, worker->hits_buf) != 0) {
-        fprintf(stderr, "coarse_search_topn failed for query %u\n", query_idx);
+    if (coarse_search_worker(worker, query) != 0) {
+        fprintf(stderr, "coarse_search failed for query %u\n", query_idx);
         return -1;
     }
     res->coarse_us = now_us() - coarse_begin_us;
@@ -794,7 +834,28 @@ static void *query_worker_main(void *arg)
                 worker->qpair = NULL;
                 worker->init_rc = -1;
             } else {
-                worker->init_rc = 0;
+                if (worker->use_faiss_coarse) {
+                    worker->coarse_labels_buf = (uint32_t *)calloc(worker->nprobe, sizeof(*worker->coarse_labels_buf));
+                    worker->coarse_distances_buf = (float *)calloc(worker->nprobe, sizeof(*worker->coarse_distances_buf));
+                    if (!worker->coarse_labels_buf || !worker->coarse_distances_buf) {
+                        perror("calloc faiss coarse buffers");
+                        free(worker->coarse_distances_buf);
+                        free(worker->coarse_labels_buf);
+                        worker->coarse_distances_buf = NULL;
+                        worker->coarse_labels_buf = NULL;
+                        free(worker->hits_buf);
+                        worker->hits_buf = NULL;
+                        spdk_free(worker->dma_buf);
+                        worker->dma_buf = NULL;
+                        spdk_nvme_ctrlr_free_io_qpair(worker->qpair);
+                        worker->qpair = NULL;
+                        worker->init_rc = -1;
+                    } else {
+                        worker->init_rc = 0;
+                    }
+                } else {
+                    worker->init_rc = 0;
+                }
             }
         }
     }
@@ -835,6 +896,10 @@ static void *query_worker_main(void *arg)
 
     free(worker->hits_buf);
     worker->hits_buf = NULL;
+    free(worker->coarse_labels_buf);
+    worker->coarse_labels_buf = NULL;
+    free(worker->coarse_distances_buf);
+    worker->coarse_distances_buf = NULL;
     if (worker->dma_buf) {
         spdk_free(worker->dma_buf);
         worker->dma_buf = NULL;
@@ -951,7 +1016,7 @@ static void print_usage(const char *prog)
 {
     fprintf(stderr,
             "Usage:\n"
-            "  %s --disk0 0000:e4:00.0 --nprobe 32 [--max-queries 1000] [--threads 20] [--base-core 0] [--cores 0,1,2,3]\n"
+            "  %s --disk0 0000:e4:00.0 --nprobe 32 [--max-queries 1000] [--threads 20] [--base-core 0] [--cores 0,1,2,3] [--coarse-backend brute|faiss]\n"
             "\n"
             "Built-in paths:\n"
             "  meta=%s\n"
@@ -992,6 +1057,7 @@ static int parse_args(int argc, char **argv, Config *cfg)
     cfg->max_queries = 1;
     cfg->threads = 1;
     cfg->base_core = -1;
+    cfg->coarse_backend = "brute";
 
     static struct option long_opts[] = {
         {"meta", required_argument, 0, 'm'},
@@ -1008,6 +1074,7 @@ static int parse_args(int argc, char **argv, Config *cfg)
         {"threads", required_argument, 0, 1005},
         {"base-core", required_argument, 0, 1006},
         {"cores", required_argument, 0, 1007},
+        {"coarse-backend", required_argument, 0, 1008},
         {0, 0, 0, 0}
     };
 
@@ -1036,6 +1103,9 @@ static int parse_args(int argc, char **argv, Config *cfg)
             case 1007:
                 cfg->cores_spec = optarg;
                 break;
+            case 1008:
+                cfg->coarse_backend = optarg;
+                break;
             default:
                 print_usage(argv[0]);
                 return -1;
@@ -1049,6 +1119,12 @@ static int parse_args(int argc, char **argv, Config *cfg)
 
     if (cfg->base_core < -1) {
         fprintf(stderr, "parse_args: base-core must be >= -1\n");
+        return -1;
+    }
+    if (strcmp(cfg->coarse_backend, "brute") != 0 &&
+        strcmp(cfg->coarse_backend, "faiss") != 0) {
+        fprintf(stderr, "parse_args: coarse-backend must be 'brute' or 'faiss' (got=%s)\n",
+                cfg->coarse_backend);
         return -1;
     }
 
@@ -1083,6 +1159,10 @@ int main(int argc, char **argv)
     uint32_t num_sorted_ids = 0;
     uint64_t run_begin_us = 0;
     bool dispatch_inited = false;
+    coarse_search_module_t *coarse_module = NULL;
+    pthread_mutex_t coarse_mu;
+    bool coarse_mu_inited = false;
+    bool use_faiss_coarse = false;
 
     memset(&meta, 0, sizeof(meta));
     memset(&qs, 0, sizeof(qs));
@@ -1109,6 +1189,21 @@ int main(int argc, char **argv)
     if (cfg.nprobe > meta.nlist) {
         fprintf(stderr, "invalid nprobe=%u nlist=%u\n", cfg.nprobe, meta.nlist);
         goto cleanup;
+    }
+    use_faiss_coarse = strcmp(cfg.coarse_backend, "faiss") == 0;
+    if (use_faiss_coarse) {
+        if (coarse_search_module_init(&coarse_module,
+                                      meta.centroids,
+                                      meta.header.dim,
+                                      meta.nlist) != 0) {
+            fprintf(stderr, "failed to initialize faiss coarse backend\n");
+            goto cleanup;
+        }
+        if (pthread_mutex_init(&coarse_mu, NULL) != 0) {
+            perror("pthread_mutex_init coarse_mu");
+            goto cleanup;
+        }
+        coarse_mu_inited = true;
     }
 
     if (load_sorted_ids_bin(cfg.sorted_ids_path, &num_sorted_ids, &sorted_ids) != 0) {
@@ -1195,6 +1290,9 @@ int main(int argc, char **argv)
         worker->max_lbas_per_read = max_lbas_per_read;
         worker->dma_bytes = dma_bytes;
         worker->nprobe = cfg.nprobe;
+        worker->coarse_module = coarse_module;
+        worker->coarse_mu = &coarse_mu;
+        worker->use_faiss_coarse = use_faiss_coarse;
         worker->max_queries = max_queries;
         worker->meta = &meta;
         worker->sorted_ids = sorted_ids;
@@ -1266,7 +1364,7 @@ join_workers:
         run_wall_us = max_done_ts_us - run_begin_us;
     }
 
-    printf("[baseline2] disk=%s sector=%u vectors_per_lba=%u nlist=%u nprobe=%u max_queries=%u threads=%u max_lbas_per_read=%u\n",
+    printf("[baseline2] disk=%s sector=%u vectors_per_lba=%u nlist=%u nprobe=%u max_queries=%u threads=%u max_lbas_per_read=%u coarse_backend=%s\n",
            disk.traddr,
            disk.sector_size,
            meta.header.vectors_per_lba,
@@ -1274,7 +1372,8 @@ join_workers:
            cfg.nprobe,
            max_queries,
            worker_count,
-           max_lbas_per_read);
+           max_lbas_per_read,
+           cfg.coarse_backend);
     if (worker_cores) {
         printf("[baseline2] worker_cores=");
         for (uint32_t i = 0; i < worker_count; i++) {
@@ -1317,6 +1416,10 @@ cleanup:
         pthread_cond_destroy(&dispatch.cv);
         pthread_mutex_destroy(&dispatch.mu);
     }
+    if (coarse_mu_inited) {
+        pthread_mutex_destroy(&coarse_mu);
+    }
+    coarse_search_module_destroy(coarse_module);
     free(workers);
     free(results);
     free(worker_cores);

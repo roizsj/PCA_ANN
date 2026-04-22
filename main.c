@@ -21,7 +21,9 @@ typedef struct {
     uint32_t max_queries;
     uint32_t nprobe;
     uint32_t read_depth;
+    uint32_t stage0_gap_merge_limit;
     uint32_t stage1_gap_merge_limit;
+    uint32_t stage0_max_read_lbas;
     uint32_t active_stages;
     const char *coarse_backend;
     const char *prune_threshold_mode;
@@ -64,7 +66,9 @@ static void init_runtime_options(runtime_options_t *opts)
     opts->max_queries = 1;
     opts->nprobe = 32;
     opts->read_depth = 8;
+    opts->stage0_gap_merge_limit = 0;
     opts->stage1_gap_merge_limit = 1;
+    opts->stage0_max_read_lbas = 0;
     opts->active_stages = NUM_STAGES;
     opts->coarse_backend = "faiss";
     opts->prune_threshold_mode = "sampled";
@@ -84,7 +88,9 @@ static int parse_runtime_options(int argc, char **argv, runtime_options_t *opts)
         {"max-queries", required_argument, 0, 'm'},
         {"nprobe", required_argument, 0, 'n'},
         {"read-depth", required_argument, 0, 'r'},
+        {"stage0-gap-merge", required_argument, 0, 1000},
         {"stage1-gap-merge", required_argument, 0, 'g'},
+        {"stage0-max-read-lbas", required_argument, 0, 1001},
         {"active-stages", required_argument, 0, 'a'},
         {"coarse-backend", required_argument, 0, 'c'},
         {"prune-threshold-mode", required_argument, 0, 't'},
@@ -107,8 +113,14 @@ static int parse_runtime_options(int argc, char **argv, runtime_options_t *opts)
             case 'r':
                 opts->read_depth = (uint32_t)strtoul(optarg, NULL, 10);
                 break;
+            case 1000:
+                opts->stage0_gap_merge_limit = (uint32_t)strtoul(optarg, NULL, 10);
+                break;
             case 'g':
                 opts->stage1_gap_merge_limit = (uint32_t)strtoul(optarg, NULL, 10);
+                break;
+            case 1001:
+                opts->stage0_max_read_lbas = (uint32_t)strtoul(optarg, NULL, 10);
                 break;
             case 'a':
                 opts->active_stages = (uint32_t)strtoul(optarg, NULL, 10);
@@ -130,7 +142,7 @@ static int parse_runtime_options(int argc, char **argv, runtime_options_t *opts)
                 break;
             default:
                 fprintf(stderr,
-                        "Usage: %s [--max-queries N] [--nprobe N] [--read-depth N] [--stage1-gap-merge N] [--active-stages N] [--coarse-backend brute|faiss] [--prune-threshold-mode centroid|sampled] [--iova-mode pa|va] [--print-per-query] [--summary-only]\n",
+                        "Usage: %s [--max-queries N] [--nprobe N] [--read-depth N] [--stage0-gap-merge N] [--stage1-gap-merge N] [--stage0-max-read-lbas N] [--active-stages N] [--coarse-backend brute|faiss] [--prune-threshold-mode centroid|sampled] [--iova-mode pa|va] [--print-per-query] [--summary-only]\n",
                         argv[0]);
                 return -1;
         }
@@ -144,8 +156,16 @@ static int parse_runtime_options(int argc, char **argv, runtime_options_t *opts)
         fprintf(stderr, "parse_runtime_options: read-depth must be in [1, %d]\n", MAX_BATCH);
         return -1;
     }
+    if (opts->stage0_gap_merge_limit > MAX_BATCH) {
+        fprintf(stderr, "parse_runtime_options: stage0-gap-merge must be in [0, %d]\n", MAX_BATCH);
+        return -1;
+    }
     if (opts->stage1_gap_merge_limit > MAX_BATCH) {
         fprintf(stderr, "parse_runtime_options: stage1-gap-merge must be in [0, %d]\n", MAX_BATCH);
+        return -1;
+    }
+    if (opts->stage0_max_read_lbas > MAX_BATCH) {
+        fprintf(stderr, "parse_runtime_options: stage0-max-read-lbas must be in [0, %d]\n", MAX_BATCH);
         return -1;
     }
     if (opts->active_stages == 0 || opts->active_stages > NUM_STAGES) {
@@ -648,7 +668,7 @@ int main(int argc, char **argv)
 
     /* 3. core 配置 */
     // TODO 如果后面要改每个stage的核数，就改这一行
-    const uint32_t stage_worker_counts[NUM_STAGES] = {4, 4, 4, 4};
+    const uint32_t stage_worker_counts[NUM_STAGES] = {8, 4, 4, 4};
     const int stage_cores[NUM_STAGES][MAX_WORKERS_PER_STAGE] = {
         {1, 5, 9, 13, 17, 19, 21, 23},
         {2, 6, 10, 14, 18, 20, 22, 24},
@@ -679,7 +699,10 @@ int main(int argc, char **argv)
     /* 5. 创建 pipeline 并启动 */
     pipeline_app_t app;
     if (pipeline_init(&app, disks, stage_worker_counts, stage_cores, topk_core,
-                      runtime_opts.read_depth, runtime_opts.stage1_gap_merge_limit,
+                      runtime_opts.read_depth,
+                      runtime_opts.stage1_gap_merge_limit,
+                      runtime_opts.stage0_gap_merge_limit,
+                      runtime_opts.stage0_max_read_lbas,
                       runtime_opts.active_stages,
                       runtime_opts.coarse_backend, runtime_opts.prune_threshold_mode,
                       threshold, ivf_meta_path, sorted_ids_path) != 0) {

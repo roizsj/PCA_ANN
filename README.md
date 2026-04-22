@@ -53,7 +53,10 @@ Build one target:
 
 ```bash
 make ivf_baseline_4way_gist
+make ivf_baseline_4way_raid_gist
+make ivf_baseline_4way_raid_gist_pipeline
 make ivf_write_disk_4way_gist
+make ivf_write_disk_raid_gist
 make ivf_write_disk_overlap_flex
 make ivf_pq_write_disk_gist ivf_pq_baseline_gist
 ```
@@ -106,6 +109,70 @@ Write the balanced/overlap list layout to four disks:
 ```
 
 For overlap layouts, metadata `num_vectors` and sorted-id count mean total IVF list entries, so duplicate vector ids are expected when a base vector appears in multiple lists.
+
+### `ivf_baseline_4way_raid_gist`
+
+This benchmark assumes all four disks hold the same full-vector IVF layout. Each query reads exactly one disk, and contiguous query batches are assigned round-robin across the four disks.
+
+Prepare that replicated single-disk GIST layout with:
+
+```bash
+./build/bin/ivf_write_disk_raid_gist \
+  --input /home/zhangshujie/ann_ssd/pca_ann/preprocessing/gist1m_output/gist_base_pca960.fvecs \
+  --centroids /home/zhangshujie/ann_ssd/pca_ann/preprocessing/gist1m_output/gist_ivf_centroids.bin \
+  --codebook /home/zhangshujie/ann_ssd/pca_ann/preprocessing/gist1m_output/gist_codebook.bin \
+  --meta /home/zhangshujie/ann_ssd/pca_ann/preprocessing/gist1m_output/ivf_meta_1_disk.bin \
+  --sorted-ids /home/zhangshujie/ann_ssd/pca_ann/preprocessing/gist1m_output/sorted_vec_ids_1_disk.bin \
+  --disk0 0000:65:00.0 \
+  --disk1 0000:66:00.0 \
+  --disk2 0000:67:00.0 \
+  --disk3 0000:68:00.0 \
+  --base-lba 0
+```
+
+```bash
+./build/bin/ivf_baseline_4way_raid_gist \
+  --disk0 0000:65:00.0 \
+  --disk1 0000:66:00.0 \
+  --disk2 0000:67:00.0 \
+  --disk3 0000:68:00.0 \
+  --nprobe 32 \
+  --max-queries 1000 \
+  --query-batch-size 32 \
+  --threads 16 \
+  --coarse-backend faiss
+```
+
+The default metadata inputs are:
+
+```text
+/home/zhangshujie/ann_ssd/pca_ann/preprocessing/gist1m_output/ivf_meta_1_disk.bin
+/home/zhangshujie/ann_ssd/pca_ann/preprocessing/gist1m_output/sorted_vec_ids_1_disk.bin
+```
+
+### `ivf_baseline_4way_raid_gist_pipeline`
+
+This is the pipelined variant of `ivf_baseline_4way_raid_gist`:
+
+- one coarse producer thread per disk
+- a fixed I/O worker pool per disk
+- same-disk coarse and async scan can overlap through a per-disk task queue
+- `faiss` coarse no longer uses one global coarse mutex
+
+`--threads` means the total number of I/O workers, not counting the 4 coarse producer threads.
+
+```bash
+./build/bin/ivf_baseline_4way_raid_gist_pipeline \
+  --disk0 0000:65:00.0 \
+  --disk1 0000:66:00.0 \
+  --disk2 0000:67:00.0 \
+  --disk3 0000:68:00.0 \
+  --nprobe 32 \
+  --max-queries 1000 \
+  --query-batch-size 32 \
+  --threads 16 \
+  --coarse-backend faiss
+```
 
 Clean generated objects and binaries:
 

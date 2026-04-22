@@ -350,8 +350,17 @@ typedef struct pipeline_app {
     /* 每个 stage worker 允许挂起的读请求深度 */
     uint32_t read_depth;
 
-    /* stage1 允许跨过的空 bundle 数量 */
+    /* 所有 stage 允许跨过的空 bundle 数量 */
     uint32_t stage1_gap_merge_limit;
+
+    /* stage0 单独允许跨过的空 bundle 数量 */
+    uint32_t stage0_gap_merge_limit;
+
+    /* 单次连续读最多合并多少个 LBA；0 表示只使用设备上限和 MAX_BATCH */
+    uint32_t max_read_lbas;
+
+    /* stage0 单次连续读最多合并多少个 LBA；0 表示只使用 max_read_lbas/设备上限 */
+    uint32_t stage0_max_read_lbas;
 
     /* 实际启用多少个 stage；最后一个 active stage 之后直接进入 top-k */
     uint32_t active_stages;
@@ -443,7 +452,9 @@ const cluster_info_t *find_cluster_info(const ivf_meta_t *meta, uint32_t cluster
  *  - stage_cores: 每个 stage 的 worker -> CPU core 映射
  *  - topk_core: top-k worker 绑定到哪个核
  *  - read_depth: 每个 stage worker 的 in-flight read 深度
- *  - stage1_gap_merge_limit: stage1 允许跨过的空 bundle 数量
+ *  - stage1_gap_merge_limit: 所有 stage 允许跨过的空 bundle 数量
+ *  - stage0_gap_merge_limit: stage0 单独允许跨过的空 bundle 数量
+ *  - stage0_max_read_lbas: stage0 单次读最多合并多少个 LBA
  *  - coarse_backend_name: coarse search 后端，brute 或 faiss
  *  - threshold: 提前终止阈值
  *  - ivf_meta_path: ivf_meta_flex.bin 的路径
@@ -456,6 +467,8 @@ int pipeline_init(
     int topk_core,
     uint32_t read_depth,
     uint32_t stage1_gap_merge_limit,
+    uint32_t stage0_gap_merge_limit,
+    uint32_t stage0_max_read_lbas,
     uint32_t active_stages,
     const char *coarse_backend_name,
     const char *prune_threshold_mode_name,

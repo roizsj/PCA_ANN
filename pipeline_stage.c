@@ -23,10 +23,12 @@ struct bundle_run {
     uint16_t begin_idx;
     uint16_t end_idx;
     uint64_t submit_us;
+    uint64_t complete_us;
     void *buf;
     struct io_waiter waiter;
     int submit_rc;
     bool submitted;
+    bool completion_seen;
 };
 
 static __thread uint32_t tls_vectors_per_lba_for_sort = 1;
@@ -779,22 +781,37 @@ static int submit_vec_bundle_range(stage_worker_t *w, struct bundle_run *run)
     return 0;
 }
 
-static int wait_vec_bundle_range(stage_worker_t *w, struct bundle_run *run, uint64_t *io_us)
+static int collect_completed_runs(stage_worker_t *w,
+                                  struct bundle_run *run_slots,
+                                  uint32_t read_depth,
+                                  uint16_t *ready_slots,
+                                  uint32_t *ready_tail,
+                                  uint32_t *ready_count)
 {
-    if (!w || !run || !run->submitted) {
+    if (!w || !run_slots || !ready_slots || !ready_tail || !ready_count) {
         return -1;
     }
 
-    while (!run->waiter.done) {
-        spdk_nvme_qpair_process_completions(w->qpair, 0);
+    int cpl_rc = spdk_nvme_qpair_process_completions(w->qpair, 0);
+    if (cpl_rc < 0) {
+        return cpl_rc;
     }
 
-    if (io_us) {
-        *io_us = now_us() - run->submit_us;
+    uint64_t complete_ts_us = now_us();
+    for (uint32_t i = 0; i < read_depth; i++) {
+        struct bundle_run *slot = &run_slots[i];
+        if (!slot->submitted || slot->completion_seen || !slot->waiter.done) {
+            continue;
+        }
+
+        slot->completion_seen = true;
+        slot->complete_us = complete_ts_us;
+        ready_slots[*ready_tail] = (uint16_t)i;
+        *ready_tail = (*ready_tail + 1) % read_depth;
+        (*ready_count)++;
     }
 
-    run->submitted = false;
-    return run->waiter.ok ? 0 : -1;
+    return 0;
 }
 /* ============================================================
  * 5. 把一个 batch 转发给下一个 stage
@@ -967,8 +984,10 @@ static void *stage_worker_main(void *arg) {
     }
 
     /*
-     * 可调深度的多缓冲：当前按“顺序等待 + 提前提交后续 run”的方式工作。
-     * 这样可以在保持处理顺序不变的同时，把 NVMe queue depth 从 2 提高到 read_depth。
+     * 可调深度的多缓冲：
+     *   1. 先尽量把读请求提交到 read_depth
+     *   2. completion 到来后先进入本 worker 的 ready queue
+     *   3. 按 ready queue 消费已完成 run，而不是按提交顺序阻塞等待 head
      */
     const uint32_t read_depth = app->read_depth;
     const size_t buf_bytes = (size_t)w->disk->sector_size * MAX_BATCH;
@@ -976,17 +995,27 @@ static void *stage_worker_main(void *arg) {
     if (max_bundles_per_read == 0) {
         max_bundles_per_read = 1;
     }
+    if (app->max_read_lbas > 0 && app->max_read_lbas < max_bundles_per_read) {
+        max_bundles_per_read = app->max_read_lbas;
+    }
+    if (w->stage_id == 0 &&
+        app->stage0_max_read_lbas > 0 &&
+        app->stage0_max_read_lbas < max_bundles_per_read) {
+        max_bundles_per_read = app->stage0_max_read_lbas;
+    }
     if (max_bundles_per_read > MAX_BATCH) {
         max_bundles_per_read = MAX_BATCH;
     }
 
     void **read_bufs = calloc(read_depth, sizeof(*read_bufs));
     struct bundle_run *run_slots = calloc(read_depth, sizeof(*run_slots));
-    if (!read_bufs || !run_slots) {
+    uint16_t *ready_slots = calloc(read_depth, sizeof(*ready_slots));
+    if (!read_bufs || !run_slots || !ready_slots) {
         fprintf(stderr,
                 "worker=%d failed to allocate read-depth state depth=%u\n",
                 w->worker_id,
                 read_depth);
+        free(ready_slots);
         free(run_slots);
         free(read_bufs);
         spdk_nvme_ctrlr_free_io_qpair(w->qpair);
@@ -1011,6 +1040,7 @@ static void *stage_worker_main(void *arg) {
             for (uint32_t j = 0; j < i; j++) {
                 spdk_free(read_bufs[j]);
             }
+            free(ready_slots);
             free(run_slots);
             free(read_bufs);
             spdk_nvme_ctrlr_free_io_qpair(w->qpair);
@@ -1086,46 +1116,85 @@ static void *stage_worker_main(void *arg) {
         const uint32_t vectors_per_lba = app->ivf_meta.header.vectors_per_lba;
         const uint32_t stage_dim = app->ivf_meta.header.shard_dims[w->stage_id];
         const uint32_t shard_bytes = app->ivf_meta.header.shard_bytes[w->stage_id];
-        const uint32_t max_gap_bundles = (w->stage_id >= 1) ? app->stage1_gap_merge_limit : 0u;
+        const uint32_t max_gap_bundles = (w->stage_id == 0)
+                                             ? app->stage0_gap_merge_limit
+                                             : app->stage1_gap_merge_limit;
 
         if (in->count > 0) {
             uint16_t next_idx = 0;
             uint32_t inflight = 0;
-            uint32_t head = 0;
-            uint32_t tail = 0;
+            uint32_t ready_head = 0;
+            uint32_t ready_tail = 0;
+            uint32_t ready_count = 0;
 
-            while (next_idx < in->count && inflight < read_depth) {
-                struct bundle_run *slot = &run_slots[tail];
-                if (!plan_bundle_run(in,
-                                     next_idx,
-                                     vectors_per_lba,
-                                     max_bundles_per_read,
-                                     max_gap_bundles,
-                                     read_bufs[tail],
-                                     slot)) {
-                    break;
+            while (next_idx < in->count || inflight > 0 || ready_count > 0) {
+                for (uint32_t slot_idx = 0;
+                     next_idx < in->count && inflight < read_depth && slot_idx < read_depth;
+                     slot_idx++) {
+                    struct bundle_run *slot = &run_slots[slot_idx];
+                    if (slot->submitted) {
+                        continue;
+                    }
+                    if (!plan_bundle_run(in,
+                                         next_idx,
+                                         vectors_per_lba,
+                                         max_bundles_per_read,
+                                         max_gap_bundles,
+                                         read_bufs[slot_idx],
+                                         slot)) {
+                        next_idx = in->count;
+                        break;
+                    }
+                    slot->submit_rc = submit_vec_bundle_range(w, slot);
+                    if (slot->submit_rc == 0) {
+                        batch_nvme_reads++;
+                        batch_nvme_read_bytes += (uint64_t)slot->bundle_count * (uint64_t)w->disk->sector_size;
+                    } else {
+                        slot->submitted = false;
+                    }
+                    next_idx = slot->end_idx;
+                    inflight++;
                 }
-                slot->submit_rc = submit_vec_bundle_range(w, slot);
-                if (slot->submit_rc == 0) {
-                    batch_nvme_reads++;
-                    batch_nvme_read_bytes += (uint64_t)slot->bundle_count * (uint64_t)w->disk->sector_size;
-                }
-                next_idx = slot->end_idx;
-                inflight++;
-                tail = (tail + 1) % read_depth;
-            }
 
-            while (inflight > 0) {
-                struct bundle_run *cur_run = &run_slots[head];
-                uint64_t run_io_us = 0;
+                if (ready_count == 0 && inflight > 0) {
+                    int collect_rc = collect_completed_runs(w,
+                                                           run_slots,
+                                                           read_depth,
+                                                           ready_slots,
+                                                           &ready_tail,
+                                                           &ready_count);
+                    if (collect_rc != 0) {
+                        fprintf(stderr,
+                                "[stage %d] process completions failed rc=%d disk=%s\n",
+                                w->stage_id,
+                                collect_rc,
+                                w->disk->traddr);
+                        break;
+                    }
+                    if (ready_count == 0) {
+                        continue;
+                    }
+                }
+
+                if (ready_count == 0) {
+                    continue;
+                }
+
+                uint16_t slot_idx = ready_slots[ready_head];
+                ready_head = (ready_head + 1) % read_depth;
+                ready_count--;
+
+                struct bundle_run *cur_run = &run_slots[slot_idx];
+                uint64_t run_io_us = cur_run->complete_us > cur_run->submit_us
+                                         ? (cur_run->complete_us - cur_run->submit_us)
+                                         : 0;
                 int cur_io_rc = cur_run->submit_rc;
 
-                if (cur_io_rc == 0) {
-                    cur_io_rc = wait_vec_bundle_range(w, cur_run, &run_io_us);
-                    batch_io_us += run_io_us;
-                    if (cur_io_rc == 0) {
-                        batch_bundles_read += cur_run->bundle_count;
-                    }
+                batch_io_us += run_io_us;
+                if (cur_io_rc == 0 && cur_run->waiter.ok) {
+                    batch_bundles_read += cur_run->bundle_count;
+                } else if (cur_io_rc == 0) {
+                    cur_io_rc = -1;
                 }
 
                 if (cur_io_rc != 0) {
@@ -1176,29 +1245,8 @@ static void *stage_worker_main(void *arg) {
                 }
 
                 inflight--;
-                head = (head + 1) % read_depth;
-
-                while (next_idx < in->count && inflight < read_depth) {
-                    struct bundle_run *slot = &run_slots[tail];
-                    if (!plan_bundle_run(in,
-                                         next_idx,
-                                         vectors_per_lba,
-                                         max_bundles_per_read,
-                                         max_gap_bundles,
-                                         read_bufs[tail],
-                                         slot)) {
-                        next_idx = in->count;
-                        break;
-                    }
-                    slot->submit_rc = submit_vec_bundle_range(w, slot);
-                    if (slot->submit_rc == 0) {
-                        batch_nvme_reads++;
-                        batch_nvme_read_bytes += (uint64_t)slot->bundle_count * (uint64_t)w->disk->sector_size;
-                    }
-                    next_idx = slot->end_idx;
-                    inflight++;
-                    tail = (tail + 1) % read_depth;
-                }
+                cur_run->submitted = false;
+                cur_run->completion_seen = false;
             }
         }
 
@@ -1251,6 +1299,7 @@ static void *stage_worker_main(void *arg) {
     for (uint32_t i = 0; i < read_depth; i++) {
         spdk_free(read_bufs[i]);
     }
+    free(ready_slots);
     free(run_slots);
     free(read_bufs);
     spdk_nvme_ctrlr_free_io_qpair(w->qpair);
@@ -1279,6 +1328,8 @@ int pipeline_init(
     int topk_core,
     uint32_t read_depth,
     uint32_t stage1_gap_merge_limit,
+    uint32_t stage0_gap_merge_limit,
+    uint32_t stage0_max_read_lbas,
     uint32_t active_stages,
     const char *coarse_backend_name_arg,
     const char *prune_threshold_mode_name_arg,
@@ -1306,6 +1357,21 @@ int pipeline_init(
                 NUM_STAGES);
         return -1;
     }
+    if (stage1_gap_merge_limit > MAX_BATCH || stage0_gap_merge_limit > MAX_BATCH) {
+        fprintf(stderr,
+                "pipeline_init: gap merge limits must be in [0,%d], got stage0=%u stage1plus=%u\n",
+                MAX_BATCH,
+                stage0_gap_merge_limit,
+                stage1_gap_merge_limit);
+        return -1;
+    }
+    if (stage0_max_read_lbas > MAX_BATCH) {
+        fprintf(stderr,
+                "pipeline_init: stage0-max-read-lbas must be in [0,%d], got=%u\n",
+                MAX_BATCH,
+                stage0_max_read_lbas);
+        return -1;
+    }
     if (backend != COARSE_BACKEND_BRUTE && backend != COARSE_BACKEND_FAISS) {
         fprintf(stderr,
                 "pipeline_init: invalid coarse backend '%s' (expected brute or faiss)\n",
@@ -1320,9 +1386,11 @@ int pipeline_init(
     }
 
     fprintf(stderr,
-            "[pipeline_init] begin read_depth=%u stage1_gap_merge_limit=%u active_stages=%u coarse_backend=%s prune_threshold_mode=%s ivf_meta=%s sorted_ids=%s\n",
+            "[pipeline_init] begin read_depth=%u stage0_gap_merge_limit=%u stage1_gap_merge_limit=%u stage0_max_read_lbas=%u active_stages=%u coarse_backend=%s prune_threshold_mode=%s ivf_meta=%s sorted_ids=%s\n",
             read_depth,
+            stage0_gap_merge_limit,
             stage1_gap_merge_limit,
+            stage0_max_read_lbas,
             active_stages,
             coarse_backend_name(backend),
             prune_threshold_mode_name(prune_mode),
@@ -1342,6 +1410,8 @@ int pipeline_init(
     app->threshold = threshold;
     app->read_depth = read_depth;
     app->stage1_gap_merge_limit = stage1_gap_merge_limit;
+    app->stage0_gap_merge_limit = stage0_gap_merge_limit;
+    app->stage0_max_read_lbas = stage0_max_read_lbas;
     app->active_stages = active_stages;
     app->coarse_backend = backend;
     app->prune_threshold_mode = prune_mode;

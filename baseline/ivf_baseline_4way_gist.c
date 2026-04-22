@@ -2,6 +2,7 @@
 #include <spdk/env.h>
 #include <spdk/nvme.h>
 
+#include "coarse_search_module.h"
 #include "query_loader.h"
 
 #include <errno.h>
@@ -112,6 +113,7 @@ typedef struct {
     const char *pca_meta_path;
     const char *disk_traddr[NUM_SHARDS];
     const char *cores_spec;
+    const char *coarse_backend;
     uint32_t nprobe;
     uint32_t max_queries;
     uint32_t threads;
@@ -149,9 +151,14 @@ typedef struct {
     struct spdk_nvme_qpair *qpair[NUM_SHARDS];
     uint32_t sector_size;
     uint32_t max_lbas_per_read;
-    uint8_t *dma_buf;
+    uint8_t *dma_buf[NUM_SHARDS];
     size_t dma_bytes;
     CoarseHit *hits_buf;
+    uint32_t *coarse_labels_buf;
+    float *coarse_distances_buf;
+    const coarse_search_module_t *coarse_module;
+    pthread_mutex_t *coarse_mu;
+    bool use_faiss_coarse;
     uint32_t nprobe;
     uint32_t max_queries;
     const IvfMeta *meta;
@@ -237,12 +244,40 @@ static void topk_finalize(TopkState *st)
     }
 }
 
+static float topk_worst_dist(const TopkState *st)
+{
+    if (!st || st->size == 0) {
+        return INFINITY;
+    }
+
+    float worst = st->items[0].dist;
+    for (uint32_t i = 1; i < st->size; i++) {
+        if (st->items[i].dist > worst) {
+            worst = st->items[i].dist;
+        }
+    }
+    return worst;
+}
+
 static float full_l2(const float *x, const float *q, uint32_t dim)
 {
     float s = 0.0f;
     for (uint32_t i = 0; i < dim; i++) {
         float d = x[i] - q[i];
         s += d * d;
+    }
+    return s;
+}
+
+static float bounded_l2(const float *x, const float *q, uint32_t dim, float limit)
+{
+    float s = 0.0f;
+    for (uint32_t i = 0; i < dim; i++) {
+        float d = x[i] - q[i];
+        s += d * d;
+        if (s > limit) {
+            return s;
+        }
     }
     return s;
 }
@@ -558,6 +593,39 @@ static int coarse_search_topn(const float *query, const IvfMeta *meta, uint32_t 
     return 0;
 }
 
+static int coarse_search_worker(QueryWorker *worker, const float *query)
+{
+    if (!worker || !query || !worker->hits_buf) {
+        return -1;
+    }
+
+    if (!worker->use_faiss_coarse) {
+        return coarse_search_topn(query, worker->meta, worker->nprobe, worker->hits_buf);
+    }
+
+    if (!worker->coarse_module || !worker->coarse_labels_buf || !worker->coarse_distances_buf ||
+        !worker->coarse_mu) {
+        return -1;
+    }
+
+    pthread_mutex_lock(worker->coarse_mu);
+    int rc = coarse_search_module_search(worker->coarse_module,
+                                         query,
+                                         worker->nprobe,
+                                         worker->coarse_labels_buf,
+                                         worker->coarse_distances_buf);
+    pthread_mutex_unlock(worker->coarse_mu);
+    if (rc != 0) {
+        return rc;
+    }
+
+    for (uint32_t i = 0; i < worker->nprobe; i++) {
+        worker->hits_buf[i].cluster_id = worker->coarse_labels_buf[i];
+        worker->hits_buf[i].dist = worker->coarse_distances_buf[i];
+    }
+    return 0;
+}
+
 static bool probe_cb(void *cb_ctx,
                      const struct spdk_nvme_transport_id *trid,
                      struct spdk_nvme_ctrlr_opts *opts)
@@ -654,23 +722,157 @@ static int read_lba_range(struct spdk_nvme_ns *ns,
     return waiter.ok ? 0 : -1;
 }
 
-static int scan_query_serial(const IvfMeta *meta,
-                             const uint32_t *sorted_ids,
-                             const float *query,
-                             const CoarseHit *hits,
-                             uint32_t nprobe,
-                             struct spdk_nvme_ns *ns[NUM_SHARDS],
-                             struct spdk_nvme_qpair *qpair[NUM_SHARDS],
-                             uint8_t *dma_buf,
-                             uint32_t sector_size,
-                             uint32_t max_lbas_per_read,
-                             TopkState *topk,
-                             uint64_t *io_us,
-                             uint64_t *compute_us,
-                             uint64_t *candidates,
-                             uint64_t *bundles_read)
+typedef struct {
+    uint32_t disk_id;
+    uint32_t next_hit;
+    const ClusterInfo *cluster;
+    uint64_t cur_lba;
+    uint32_t remaining_lbas;
+    uint32_t local_base;
+    uint32_t active_cluster_id;
+    uint32_t active_lba_count;
+    uint32_t active_local_base;
+    IoWaiter waiter;
+    bool active;
+    bool done;
+} DiskScanState;
+
+static bool load_next_cluster_for_disk(DiskScanState *st,
+                                       const IvfMeta *meta,
+                                       const CoarseHit *hits,
+                                       uint32_t nprobe)
 {
-    if (!meta || !sorted_ids || !query || !hits || !topk || !io_us || !compute_us || !candidates || !bundles_read) {
+    while (st->next_hit < nprobe) {
+        uint32_t hit_idx = st->next_hit++;
+        if (hits[hit_idx].cluster_id == UINT32_MAX) {
+            continue;
+        }
+
+        const ClusterInfo *ci = &meta->clusters[hits[hit_idx].cluster_id];
+        if (ci->disk_id != st->disk_id || ci->num_lbas == 0) {
+            continue;
+        }
+
+        st->cluster = ci;
+        st->cur_lba = ci->start_lba;
+        st->remaining_lbas = ci->num_lbas;
+        st->local_base = 0;
+        return true;
+    }
+
+    st->cluster = NULL;
+    st->done = true;
+    return false;
+}
+
+static int submit_next_disk_chunk(DiskScanState *st,
+                                  const IvfMeta *meta,
+                                  const CoarseHit *hits,
+                                  uint32_t nprobe,
+                                  struct spdk_nvme_ns *ns,
+                                  struct spdk_nvme_qpair *qpair,
+                                  uint8_t *dma_buf,
+                                  uint32_t max_lbas_per_read)
+{
+    if (st->active) {
+        return 0;
+    }
+
+    while (!st->cluster || st->remaining_lbas == 0) {
+        if (!load_next_cluster_for_disk(st, meta, hits, nprobe)) {
+            return 0;
+        }
+    }
+
+    uint32_t chunk_lbas = st->remaining_lbas > max_lbas_per_read
+                              ? max_lbas_per_read
+                              : st->remaining_lbas;
+    st->waiter.done = false;
+    st->waiter.ok = 0;
+    st->active_cluster_id = st->cluster->cluster_id;
+    st->active_lba_count = chunk_lbas;
+    st->active_local_base = st->local_base;
+
+    int rc = spdk_nvme_ns_cmd_read(ns,
+                                   qpair,
+                                   dma_buf,
+                                   st->cur_lba,
+                                   chunk_lbas,
+                                   io_done_cb,
+                                   &st->waiter,
+                                   0);
+    if (rc != 0) {
+        fprintf(stderr,
+                "submit_next_disk_chunk: submit failed cluster=%u disk=%u lba=%" PRIu64 " count=%u rc=%d\n",
+                st->cluster->cluster_id,
+                st->disk_id,
+                st->cur_lba,
+                chunk_lbas,
+                rc);
+        return -1;
+    }
+
+    st->active = true;
+    st->cur_lba += chunk_lbas;
+    st->remaining_lbas -= chunk_lbas;
+    st->local_base += chunk_lbas * meta->header.vectors_per_lba;
+    return 1;
+}
+
+static int process_completed_disk_chunk(const DiskScanState *st,
+                                        const IvfMeta *meta,
+                                        const uint32_t *sorted_ids,
+                                        const float *query,
+                                        const uint8_t *dma_buf,
+                                        uint32_t sector_size,
+                                        TopkState *topk,
+                                        uint64_t *compute_us,
+                                        uint64_t *candidates,
+                                        uint64_t *bundles_read)
+{
+    const ClusterInfo *ci = &meta->clusters[st->active_cluster_id];
+    *bundles_read += st->active_lba_count;
+
+    uint64_t compute_begin_us = now_us();
+    for (uint32_t b = 0; b < st->active_lba_count; b++) {
+        uint32_t base_local_idx = st->active_local_base + b * meta->header.vectors_per_lba;
+        for (uint32_t lane = 0; lane < meta->header.vectors_per_lba; lane++) {
+            uint32_t local_idx = base_local_idx + lane;
+            if (local_idx >= ci->num_vectors) {
+                break;
+            }
+            uint32_t sorted_pos = ci->sorted_id_base + local_idx;
+            uint32_t vec_id = sorted_ids[sorted_pos];
+            const float *vec = (const float *)(dma_buf + (size_t)b * sector_size +
+                                               (size_t)lane * meta->header.dim * sizeof(float));
+            float limit = topk->size < TOPK ? INFINITY : topk_worst_dist(topk);
+            float dist = bounded_l2(vec, query, meta->header.dim, limit);
+            topk_insert(topk, vec_id, dist);
+            (*candidates)++;
+        }
+    }
+    *compute_us += now_us() - compute_begin_us;
+    return 0;
+}
+
+static int scan_query_disk_parallel(const IvfMeta *meta,
+                                    const uint32_t *sorted_ids,
+                                    const float *query,
+                                    const CoarseHit *hits,
+                                    uint32_t nprobe,
+                                    struct spdk_nvme_ns *ns[NUM_SHARDS],
+                                    struct spdk_nvme_qpair *qpair[NUM_SHARDS],
+                                    uint8_t *dma_buf[NUM_SHARDS],
+                                    uint32_t sector_size,
+                                    uint32_t max_lbas_per_read,
+                                    TopkState *topk,
+                                    uint64_t *io_us,
+                                    uint64_t *compute_us,
+                                    uint64_t *candidates,
+                                    uint64_t *bundles_read)
+{
+    if (!meta || !sorted_ids || !query || !hits || !dma_buf || !topk ||
+        !io_us || !compute_us || !candidates || !bundles_read) {
         return -1;
     }
 
@@ -680,55 +882,91 @@ static int scan_query_serial(const IvfMeta *meta,
     *candidates = 0;
     *bundles_read = 0;
 
-    for (uint32_t h = 0; h < nprobe; h++) {
-        if (hits[h].cluster_id == UINT32_MAX) {
-            continue;
+    DiskScanState states[NUM_SHARDS];
+    memset(states, 0, sizeof(states));
+
+    uint32_t active_reads = 0;
+    for (uint32_t d = 0; d < NUM_SHARDS; d++) {
+        states[d].disk_id = d;
+        if (submit_next_disk_chunk(&states[d],
+                                   meta,
+                                   hits,
+                                   nprobe,
+                                   ns[d],
+                                   qpair[d],
+                                   dma_buf[d],
+                                   max_lbas_per_read) < 0) {
+            return -1;
         }
+        if (states[d].active) {
+            active_reads++;
+        }
+    }
 
-        const ClusterInfo *ci = &meta->clusters[hits[h].cluster_id];
-        uint32_t disk_id = ci->disk_id;
-        uint32_t remaining_lbas = ci->num_lbas;
-        uint64_t cur_lba = ci->start_lba;
-        uint32_t local_base = 0;
-
-        while (remaining_lbas > 0) {
-            uint32_t chunk_lbas = remaining_lbas > max_lbas_per_read ? max_lbas_per_read : remaining_lbas;
-
-            uint64_t io_begin_us = now_us();
-            if (read_lba_range(ns[disk_id], qpair[disk_id], dma_buf, cur_lba, chunk_lbas) != 0) {
-                fprintf(stderr,
-                        "read_lba_range failed cluster=%u disk=%u lba=%" PRIu64 " count=%u\n",
-                        ci->cluster_id,
-                        disk_id,
-                        cur_lba,
-                        chunk_lbas);
-                return -1;
-            }
-            *io_us += now_us() - io_begin_us;
-            *bundles_read += chunk_lbas;
-
-            uint64_t compute_begin_us = now_us();
-            for (uint32_t b = 0; b < chunk_lbas; b++) {
-                uint32_t base_local_idx = local_base + b * meta->header.vectors_per_lba;
-                for (uint32_t lane = 0; lane < meta->header.vectors_per_lba; lane++) {
-                    uint32_t local_idx = base_local_idx + lane;
-                    if (local_idx >= ci->num_vectors) {
-                        break;
-                    }
-                    uint32_t sorted_pos = ci->sorted_id_base + local_idx;
-                    uint32_t vec_id = sorted_ids[sorted_pos];
-                    const float *vec = (const float *)(dma_buf + (size_t)b * sector_size +
-                                                       (size_t)lane * meta->header.dim * sizeof(float));
-                    float dist = full_l2(vec, query, meta->header.dim);
-                    topk_insert(topk, vec_id, dist);
-                    (*candidates)++;
+    while (active_reads > 0) {
+        uint64_t wait_begin_us = now_us();
+        bool any_done = false;
+        while (!any_done) {
+            for (uint32_t d = 0; d < NUM_SHARDS; d++) {
+                if (!states[d].active) {
+                    continue;
+                }
+                int cpl_rc = spdk_nvme_qpair_process_completions(qpair[d], 0);
+                if (cpl_rc < 0) {
+                    fprintf(stderr, "process_completions failed for disk %u\n", d);
+                    states[d].waiter.ok = 0;
+                    states[d].waiter.done = true;
+                }
+                if (states[d].waiter.done) {
+                    any_done = true;
                 }
             }
-            *compute_us += now_us() - compute_begin_us;
+        }
+        *io_us += now_us() - wait_begin_us;
 
-            cur_lba += chunk_lbas;
-            remaining_lbas -= chunk_lbas;
-            local_base += chunk_lbas * meta->header.vectors_per_lba;
+        for (uint32_t d = 0; d < NUM_SHARDS; d++) {
+            DiskScanState *st = &states[d];
+            if (!st->active || !st->waiter.done) {
+                continue;
+            }
+
+            st->active = false;
+            active_reads--;
+            if (!st->waiter.ok) {
+                fprintf(stderr,
+                        "I/O failed cluster=%u disk=%u lba_count=%u\n",
+                        st->active_cluster_id,
+                        d,
+                        st->active_lba_count);
+                return -1;
+            }
+
+            if (process_completed_disk_chunk(st,
+                                             meta,
+                                             sorted_ids,
+                                             query,
+                                             dma_buf[d],
+                                             sector_size,
+                                             topk,
+                                             compute_us,
+                                             candidates,
+                                             bundles_read) != 0) {
+                return -1;
+            }
+
+            if (submit_next_disk_chunk(st,
+                                       meta,
+                                       hits,
+                                       nprobe,
+                                       ns[d],
+                                       qpair[d],
+                                       dma_buf[d],
+                                       max_lbas_per_read) < 0) {
+                return -1;
+            }
+            if (st->active) {
+                active_reads++;
+            }
         }
     }
 
@@ -747,27 +985,27 @@ static int run_single_query(QueryWorker *worker, uint32_t query_idx)
 
     uint64_t total_begin_us = now_us();
     uint64_t coarse_begin_us = now_us();
-    if (coarse_search_topn(query, worker->meta, worker->nprobe, worker->hits_buf) != 0) {
-        fprintf(stderr, "coarse_search_topn failed for query %u\n", query_idx);
+    if (coarse_search_worker(worker, query) != 0) {
+        fprintf(stderr, "coarse_search failed for query %u\n", query_idx);
         return -1;
     }
     res->coarse_us = now_us() - coarse_begin_us;
 
-    if (scan_query_serial(worker->meta,
-                          worker->sorted_ids,
-                          query,
-                          worker->hits_buf,
-                          worker->nprobe,
-                          worker->ns,
-                          worker->qpair,
-                          worker->dma_buf,
-                          worker->sector_size,
-                          worker->max_lbas_per_read,
-                          &topk,
-                          &res->io_us,
-                          &res->compute_us,
-                          &res->candidates,
-                          &res->bundles_read) != 0) {
+    if (scan_query_disk_parallel(worker->meta,
+                                 worker->sorted_ids,
+                                 query,
+                                 worker->hits_buf,
+                                 worker->nprobe,
+                                 worker->ns,
+                                 worker->qpair,
+                                 worker->dma_buf,
+                                 worker->sector_size,
+                                 worker->max_lbas_per_read,
+                                 &topk,
+                                 &res->io_us,
+                                 &res->compute_us,
+                                 &res->candidates,
+                                 &res->bundles_read) != 0) {
         return -1;
     }
 
@@ -793,22 +1031,41 @@ static void *query_worker_main(void *arg)
         }
     }
     if (worker->init_rc == 0) {
-        worker->dma_buf = (uint8_t *)spdk_zmalloc(worker->dma_bytes,
-                                                  worker->sector_size,
-                                                  NULL,
-                                                  SPDK_ENV_NUMA_ID_ANY,
-                                                  SPDK_MALLOC_DMA);
-        if (!worker->dma_buf) {
-            worker->init_rc = -1;
-        } else {
+        for (int s = 0; s < NUM_SHARDS; s++) {
+            worker->dma_buf[s] = (uint8_t *)spdk_zmalloc(worker->dma_bytes,
+                                                         worker->sector_size,
+                                                         NULL,
+                                                         SPDK_ENV_NUMA_ID_ANY,
+                                                         SPDK_MALLOC_DMA);
+            if (!worker->dma_buf[s]) {
+                worker->init_rc = -1;
+                break;
+            }
+        }
+        if (worker->init_rc == 0) {
             worker->hits_buf = (CoarseHit *)calloc(worker->nprobe, sizeof(*worker->hits_buf));
             if (!worker->hits_buf) {
                 perror("calloc hits_buf");
-                spdk_free(worker->dma_buf);
-                worker->dma_buf = NULL;
                 worker->init_rc = -1;
             } else {
-                worker->init_rc = 0;
+                if (worker->use_faiss_coarse) {
+                    worker->coarse_labels_buf = (uint32_t *)calloc(worker->nprobe, sizeof(*worker->coarse_labels_buf));
+                    worker->coarse_distances_buf = (float *)calloc(worker->nprobe, sizeof(*worker->coarse_distances_buf));
+                    if (!worker->coarse_labels_buf || !worker->coarse_distances_buf) {
+                        perror("calloc faiss coarse buffers");
+                        free(worker->coarse_distances_buf);
+                        free(worker->coarse_labels_buf);
+                        worker->coarse_distances_buf = NULL;
+                        worker->coarse_labels_buf = NULL;
+                        free(worker->hits_buf);
+                        worker->hits_buf = NULL;
+                        worker->init_rc = -1;
+                    } else {
+                        worker->init_rc = 0;
+                    }
+                } else {
+                    worker->init_rc = 0;
+                }
             }
         }
     }
@@ -849,9 +1106,15 @@ static void *query_worker_main(void *arg)
 
     free(worker->hits_buf);
     worker->hits_buf = NULL;
-    if (worker->dma_buf) {
-        spdk_free(worker->dma_buf);
-        worker->dma_buf = NULL;
+    free(worker->coarse_labels_buf);
+    worker->coarse_labels_buf = NULL;
+    free(worker->coarse_distances_buf);
+    worker->coarse_distances_buf = NULL;
+    for (int s = 0; s < NUM_SHARDS; s++) {
+        if (worker->dma_buf[s]) {
+            spdk_free(worker->dma_buf[s]);
+            worker->dma_buf[s] = NULL;
+        }
     }
     for (int s = 0; s < NUM_SHARDS; s++) {
         if (worker->qpair[s]) {
@@ -968,7 +1231,7 @@ static void print_usage(const char *prog)
     fprintf(stderr,
             "Usage:\n"
             "  %s --disk0 0000:e4:00.0 --disk1 0000:e5:00.0 --disk2 0000:e6:00.0 --disk3 0000:e7:00.0 \\\n"
-            "     --nprobe 32 [--max-queries 1000] [--threads 20] [--base-core 0] [--cores 0,1,2,3]\n"
+            "     --nprobe 32 [--max-queries 1000] [--threads 20] [--base-core 0] [--cores 0,1,2,3] [--coarse-backend brute|faiss]\n"
             "\n"
             "Built-in paths:\n"
             "  meta=%s\n"
@@ -1009,6 +1272,7 @@ static int parse_args(int argc, char **argv, Config *cfg)
     cfg->max_queries = 0;
     cfg->threads = 1;
     cfg->base_core = -1;
+    cfg->coarse_backend = "brute";
 
     static struct option long_opts[] = {
         {"meta", required_argument, 0, 'm'},
@@ -1028,6 +1292,7 @@ static int parse_args(int argc, char **argv, Config *cfg)
         {"threads", required_argument, 0, 1005},
         {"base-core", required_argument, 0, 1006},
         {"cores", required_argument, 0, 1007},
+        {"coarse-backend", required_argument, 0, 1008},
         {0, 0, 0, 0}
     };
 
@@ -1055,6 +1320,9 @@ static int parse_args(int argc, char **argv, Config *cfg)
             case 1007:
                 cfg->cores_spec = optarg;
                 break;
+            case 1008:
+                cfg->coarse_backend = optarg;
+                break;
             case 1100: cfg->disk_traddr[0] = optarg; break;
             case 1101: cfg->disk_traddr[1] = optarg; break;
             case 1102: cfg->disk_traddr[2] = optarg; break;
@@ -1073,6 +1341,12 @@ static int parse_args(int argc, char **argv, Config *cfg)
 
     if (cfg->base_core < -1) {
         fprintf(stderr, "parse_args: base-core must be >= -1\n");
+        return -1;
+    }
+    if (strcmp(cfg->coarse_backend, "brute") != 0 &&
+        strcmp(cfg->coarse_backend, "faiss") != 0) {
+        fprintf(stderr, "parse_args: coarse-backend must be 'brute' or 'faiss' (got=%s)\n",
+                cfg->coarse_backend);
         return -1;
     }
 
@@ -1107,6 +1381,10 @@ int main(int argc, char **argv)
     uint32_t num_sorted_ids = 0;
     uint64_t run_begin_us = 0;
     bool dispatch_inited = false;
+    coarse_search_module_t *coarse_module = NULL;
+    pthread_mutex_t coarse_mu;
+    bool coarse_mu_inited = false;
+    bool use_faiss_coarse = false;
 
     memset(&meta, 0, sizeof(meta));
     memset(&qs, 0, sizeof(qs));
@@ -1133,6 +1411,21 @@ int main(int argc, char **argv)
     if (cfg.nprobe > meta.nlist) {
         fprintf(stderr, "invalid nprobe=%u nlist=%u\n", cfg.nprobe, meta.nlist);
         goto cleanup;
+    }
+    use_faiss_coarse = strcmp(cfg.coarse_backend, "faiss") == 0;
+    if (use_faiss_coarse) {
+        if (coarse_search_module_init(&coarse_module,
+                                      meta.centroids,
+                                      meta.header.dim,
+                                      meta.nlist) != 0) {
+            fprintf(stderr, "failed to initialize faiss coarse backend\n");
+            goto cleanup;
+        }
+        if (pthread_mutex_init(&coarse_mu, NULL) != 0) {
+            perror("pthread_mutex_init coarse_mu");
+            goto cleanup;
+        }
+        coarse_mu_inited = true;
     }
 
     if (load_sorted_ids_bin(cfg.sorted_ids_path, &num_sorted_ids, &sorted_ids) != 0) {
@@ -1230,6 +1523,9 @@ int main(int argc, char **argv)
         worker->max_lbas_per_read = max_lbas_per_read;
         worker->dma_bytes = dma_bytes;
         worker->nprobe = cfg.nprobe;
+        worker->coarse_module = coarse_module;
+        worker->coarse_mu = &coarse_mu;
+        worker->use_faiss_coarse = use_faiss_coarse;
         worker->max_queries = max_queries;
         worker->meta = &meta;
         worker->sorted_ids = sorted_ids;
@@ -1301,7 +1597,7 @@ join_workers:
         run_wall_us = max_done_ts_us - run_begin_us;
     }
 
-    printf("[baseline4way-cluster] disks=%s,%s,%s,%s sector=%u vectors_per_lba=%u nlist=%u nprobe=%u max_queries=%u threads=%u max_lbas_per_read=%u\n",
+    printf("[baseline4way-cluster] disks=%s,%s,%s,%s sector=%u vectors_per_lba=%u nlist=%u nprobe=%u max_queries=%u threads=%u max_lbas_per_read=%u coarse_backend=%s\n",
            disks[0].traddr,
            disks[1].traddr,
            disks[2].traddr,
@@ -1312,7 +1608,8 @@ join_workers:
            cfg.nprobe,
            max_queries,
            worker_count,
-           max_lbas_per_read);
+           max_lbas_per_read,
+           cfg.coarse_backend);
     if (worker_cores) {
         printf("[baseline4way-cluster] worker_cores=");
         for (uint32_t i = 0; i < worker_count; i++) {
@@ -1355,6 +1652,10 @@ cleanup:
         pthread_cond_destroy(&dispatch.cv);
         pthread_mutex_destroy(&dispatch.mu);
     }
+    if (coarse_mu_inited) {
+        pthread_mutex_destroy(&coarse_mu);
+    }
+    coarse_search_module_destroy(coarse_module);
     free(workers);
     free(results);
     free(worker_cores);
