@@ -11,7 +11,9 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define NUM_SHARDS 4
+#define MAX_SHARDS 4
+#define NUM_DISKS 4
+#define NUM_SHARDS MAX_SHARDS
 #define MAGIC_META 0x49564634u /* "IVF4" */
 
 typedef struct {
@@ -57,15 +59,18 @@ typedef struct {
     const char *codebook_bin;
     const char *meta_out;
     const char *sorted_ids_out;
-    const char *disk_addrs[NUM_SHARDS];
+    const char *disk_addrs[NUM_DISKS];
     uint32_t dim;
-    uint32_t shard_dims[NUM_SHARDS];
+    uint32_t num_shards;
+    uint32_t shard_dims[MAX_SHARDS];
+    uint32_t disk_shards[NUM_DISKS];
+    bool disk_shards_set;
     uint64_t base_lba;
 } AppConfig;
 
 typedef struct {
     AppConfig cfg;
-    DiskTarget disks[NUM_SHARDS];
+    DiskTarget disks[NUM_DISKS];
     int found_disks;
 } AppState;
 
@@ -74,14 +79,15 @@ typedef struct {
     uint32_t version;
     uint32_t dim;
     uint32_t num_shards;
-    uint32_t shard_dims[NUM_SHARDS];
-    uint32_t shard_offsets[NUM_SHARDS];
-    uint32_t shard_bytes[NUM_SHARDS];
+    uint32_t shard_dims[MAX_SHARDS];
+    uint32_t shard_offsets[MAX_SHARDS];
+    uint32_t shard_bytes[MAX_SHARDS];
     uint32_t vectors_per_lba;
     uint32_t nlist;
     uint32_t num_vectors;
     uint32_t sector_size;
     uint64_t base_lba;
+    uint32_t shard_vectors_per_lba[MAX_SHARDS];
 } MetaHeaderFlex;
 
 static void die(const char *msg) {
@@ -132,14 +138,47 @@ static uint64_t parse_u64_arg(const char *name, const char *value) {
     return (uint64_t)parsed;
 }
 
+static void parse_disk_shards_arg(const char *value, AppConfig *cfg) {
+    if (!value || !cfg) {
+        die_msg("disk-shards requires a value");
+    }
+
+    char *copy = strdup(value);
+    if (!copy) {
+        die("strdup disk-shards");
+    }
+
+    uint32_t idx = 0;
+    char *saveptr = NULL;
+    for (char *tok = strtok_r(copy, ",", &saveptr);
+         tok != NULL;
+         tok = strtok_r(NULL, ",", &saveptr)) {
+        if (idx >= NUM_DISKS) {
+            fprintf(stderr, "disk-shards has too many entries, expected %d\n", NUM_DISKS);
+            free(copy);
+            exit(EXIT_FAILURE);
+        }
+        cfg->disk_shards[idx++] = parse_u32_arg("disk-shards", tok);
+    }
+
+    if (idx != NUM_DISKS) {
+        fprintf(stderr, "disk-shards must have exactly %d comma-separated entries\n", NUM_DISKS);
+        free(copy);
+        exit(EXIT_FAILURE);
+    }
+
+    cfg->disk_shards_set = true;
+    free(copy);
+}
+
 static void compute_shard_layout(const AppConfig *cfg,
-                                 uint32_t shard_offsets[NUM_SHARDS],
-                                 uint32_t shard_bytes[NUM_SHARDS]) {
+                                 uint32_t shard_offsets[MAX_SHARDS],
+                                 uint32_t shard_bytes[MAX_SHARDS]) {
     uint64_t total_dim = 0;
 
-    for (int s = 0; s < NUM_SHARDS; s++) {
+    for (uint32_t s = 0; s < cfg->num_shards; s++) {
         if (cfg->shard_dims[s] == 0) {
-            fprintf(stderr, "disk%d-dim must be > 0\n", s);
+            fprintf(stderr, "shard%u-dim must be > 0\n", s);
             exit(EXIT_FAILURE);
         }
         shard_offsets[s] = (uint32_t)total_dim;
@@ -153,26 +192,28 @@ static void compute_shard_layout(const AppConfig *cfg,
 
     if (total_dim != cfg->dim) {
         fprintf(stderr,
-                "sum of shard dims mismatch: disk0+disk1+disk2+disk3=%" PRIu64
-                ", expected dim=%u\n",
+                "sum of active shard dims mismatch: got=%" PRIu64 ", expected dim=%u\n",
                 total_dim, cfg->dim);
         exit(EXIT_FAILURE);
     }
 }
 
 static uint32_t compute_vectors_per_lba(uint32_t sector_size,
-                                        const uint32_t shard_bytes[NUM_SHARDS]) {
+                                        const uint32_t shard_bytes[MAX_SHARDS],
+                                        uint32_t num_shards,
+                                        uint32_t shard_vectors_per_lba[MAX_SHARDS]) {
     uint32_t vectors_per_lba = UINT32_MAX;
 
-    for (int s = 0; s < NUM_SHARDS; s++) {
+    for (uint32_t s = 0; s < num_shards; s++) {
         uint32_t shard_byte = shard_bytes[s];
         uint32_t per_disk = sector_size / shard_byte;
         if (per_disk == 0) {
             fprintf(stderr,
-                    "disk%d shard is too wide for one sector: sector=%u shard_bytes=%u\n",
+                    "shard%u is too wide for one sector: sector=%u shard_bytes=%u\n",
                     s, sector_size, shard_byte);
             exit(EXIT_FAILURE);
         }
+        shard_vectors_per_lba[s] = per_disk;
         if (per_disk < vectors_per_lba) {
             vectors_per_lba = per_disk;
         }
@@ -350,7 +391,7 @@ static bool probe_cb(void *cb_ctx,
     (void)opts;
     AppState *app = (AppState *)cb_ctx;
 
-    for (int i = 0; i < NUM_SHARDS; i++) {
+    for (int i = 0; i < NUM_DISKS; i++) {
         if (strcmp(trid->traddr, app->cfg.disk_addrs[i]) == 0) {
             return true;
         }
@@ -365,7 +406,7 @@ static void attach_cb(void *cb_ctx,
     (void)opts;
     AppState *app = (AppState *)cb_ctx;
 
-    for (int i = 0; i < NUM_SHARDS; i++) {
+    for (int i = 0; i < NUM_DISKS; i++) {
         if (strcmp(trid->traddr, app->cfg.disk_addrs[i]) == 0) {
             struct spdk_nvme_ns *ns = spdk_nvme_ctrlr_get_ns(ctrlr, 1);
             if (!ns || !spdk_nvme_ns_is_active(ns)) {
@@ -403,8 +444,8 @@ static void init_spdk_and_attach(AppState *app) {
         die_msg("spdk_nvme_probe failed");
     }
 
-    if (app->found_disks != NUM_SHARDS) {
-        fprintf(stderr, "expected %d disks, found %d\n", NUM_SHARDS, app->found_disks);
+    if (app->found_disks != NUM_DISKS) {
+        fprintf(stderr, "expected %d disks, found %d\n", NUM_DISKS, app->found_disks);
         exit(EXIT_FAILURE);
     }
 
@@ -414,7 +455,7 @@ static void init_spdk_and_attach(AppState *app) {
             die_msg("invalid sector size 0");
         }
 
-        for (int i = 1; i < NUM_SHARDS; i++) {
+        for (int i = 1; i < NUM_DISKS; i++) {
             if (app->disks[i].sector_size != sector_size) {
                 die_msg("all 4 disks must have the same sector size");
             }
@@ -423,13 +464,13 @@ static void init_spdk_and_attach(AppState *app) {
 }
 
 static void cleanup_spdk(AppState *app) {
-    for (int i = 0; i < NUM_SHARDS; i++) {
+    for (int i = 0; i < NUM_DISKS; i++) {
         if (app->disks[i].qpair) {
             spdk_nvme_ctrlr_free_io_qpair(app->disks[i].qpair);
             app->disks[i].qpair = NULL;
         }
     }
-    for (int i = 0; i < NUM_SHARDS; i++) {
+    for (int i = 0; i < NUM_DISKS; i++) {
         if (app->disks[i].ctrlr) {
             spdk_nvme_detach(app->disks[i].ctrlr);
             app->disks[i].ctrlr = NULL;
@@ -448,9 +489,10 @@ static void save_meta_file(const char *path,
                            uint32_t nlist,
                            uint32_t num_vectors,
                            uint32_t sector_size,
-                           const uint32_t shard_offsets[NUM_SHARDS],
-                           const uint32_t shard_bytes[NUM_SHARDS],
+                           const uint32_t shard_offsets[MAX_SHARDS],
+                           const uint32_t shard_bytes[MAX_SHARDS],
                            uint32_t vectors_per_lba,
+                           const uint32_t shard_vectors_per_lba[MAX_SHARDS],
                            const ClusterMetaEntry *cluster_meta,
                            const float *centroids) {
     FILE *fp = fopen(path, "wb");
@@ -462,9 +504,9 @@ static void save_meta_file(const char *path,
         MetaHeaderFlex hdr;
         memset(&hdr, 0, sizeof(hdr));
         hdr.magic = MAGIC_META;
-        hdr.version = 1;
+        hdr.version = 2;
         hdr.dim = cfg->dim;
-        hdr.num_shards = NUM_SHARDS;
+        hdr.num_shards = cfg->num_shards;
         memcpy(hdr.shard_dims, cfg->shard_dims, sizeof(hdr.shard_dims));
         memcpy(hdr.shard_offsets, shard_offsets, sizeof(hdr.shard_offsets));
         memcpy(hdr.shard_bytes, shard_bytes, sizeof(hdr.shard_bytes));
@@ -473,6 +515,9 @@ static void save_meta_file(const char *path,
         hdr.num_vectors = num_vectors;
         hdr.sector_size = sector_size;
         hdr.base_lba = cfg->base_lba;
+        memcpy(hdr.shard_vectors_per_lba,
+               shard_vectors_per_lba,
+               sizeof(hdr.shard_vectors_per_lba));
 
         if (fwrite(&hdr, sizeof(hdr), 1, fp) != 1) {
             die("write meta header");
@@ -516,17 +561,30 @@ static void usage(const char *prog) {
             "     --disk2-dim 16 --disk3-dim 32 \\\n"
             "     --disk0 0000:5e:00.0 --disk1 0000:60:00.0 \\\n"
             "     --disk2 0000:61:00.0 --disk3 0000:62:00.0 \\\n"
+            "     [--num-shards 4] [--disk-shards 0,1,2,3] \\\n"
             "     [--sorted-ids sorted_vec_ids.bin] [--base-lba 0]\n"
+            "\n"
+            "Example: 3 shards where disk0 and disk1 both store shard0:\n"
+            "  %s --input base.fvecs --centroids centroids.bin --codebook codebook.bin \\\n"
+            "     --meta ivf_meta_flex.bin --dim 960 --num-shards 3 \\\n"
+            "     --shard0-dim 320 --shard1-dim 320 --shard2-dim 320 \\\n"
+            "     --disk-shards 0,0,1,2 --disk0 BDF0 --disk1 BDF1 --disk2 BDF2 --disk3 BDF3\n"
             "\n"
             "Notes:\n"
             "  - Exactly 4 disks are used.\n"
-            "  - dim must equal disk0-dim + disk1-dim + disk2-dim + disk3-dim.\n"
+            "  - num-shards defaults to 4 and must be in [1, 4].\n"
+            "  - disk-shards maps physical disk0..disk3 to shard ids.\n"
+            "  - dim must equal the sum of active shard dims.\n"
             "  - The packed vectors_per_lba is limited by the widest shard.\n",
-            prog);
+            prog, prog);
 }
 
 static void parse_args(int argc, char **argv, AppConfig *cfg) {
     memset(cfg, 0, sizeof(*cfg));
+    cfg->num_shards = MAX_SHARDS;
+    for (uint32_t i = 0; i < NUM_DISKS; i++) {
+        cfg->disk_shards[i] = i;
+    }
 
     static struct option long_opts[] = {
         {"input", required_argument, 0, 'i'},
@@ -536,6 +594,8 @@ static void parse_args(int argc, char **argv, AppConfig *cfg) {
         {"sorted-ids", required_argument, 0, 's'},
         {"base-lba", required_argument, 0, 'b'},
         {"dim", required_argument, 0, 'd'},
+        {"num-shards", required_argument, 0, 900},
+        {"disk-shards", required_argument, 0, 901},
         {"disk0", required_argument, 0, 1000},
         {"disk1", required_argument, 0, 1001},
         {"disk2", required_argument, 0, 1002},
@@ -544,6 +604,10 @@ static void parse_args(int argc, char **argv, AppConfig *cfg) {
         {"disk1-dim", required_argument, 0, 1101},
         {"disk2-dim", required_argument, 0, 1102},
         {"disk3-dim", required_argument, 0, 1103},
+        {"shard0-dim", required_argument, 0, 1100},
+        {"shard1-dim", required_argument, 0, 1101},
+        {"shard2-dim", required_argument, 0, 1102},
+        {"shard3-dim", required_argument, 0, 1103},
         {0, 0, 0, 0}
     };
 
@@ -572,6 +636,12 @@ static void parse_args(int argc, char **argv, AppConfig *cfg) {
             case 'd':
                 cfg->dim = parse_u32_arg("dim", optarg);
                 break;
+            case 900:
+                cfg->num_shards = parse_u32_arg("num-shards", optarg);
+                break;
+            case 901:
+                parse_disk_shards_arg(optarg, cfg);
+                break;
             case 1000:
                 cfg->disk_addrs[0] = optarg;
                 break;
@@ -585,16 +655,16 @@ static void parse_args(int argc, char **argv, AppConfig *cfg) {
                 cfg->disk_addrs[3] = optarg;
                 break;
             case 1100:
-                cfg->shard_dims[0] = parse_u32_arg("disk0-dim", optarg);
+                cfg->shard_dims[0] = parse_u32_arg("shard0-dim", optarg);
                 break;
             case 1101:
-                cfg->shard_dims[1] = parse_u32_arg("disk1-dim", optarg);
+                cfg->shard_dims[1] = parse_u32_arg("shard1-dim", optarg);
                 break;
             case 1102:
-                cfg->shard_dims[2] = parse_u32_arg("disk2-dim", optarg);
+                cfg->shard_dims[2] = parse_u32_arg("shard2-dim", optarg);
                 break;
             case 1103:
-                cfg->shard_dims[3] = parse_u32_arg("disk3-dim", optarg);
+                cfg->shard_dims[3] = parse_u32_arg("shard3-dim", optarg);
                 break;
             default:
                 usage(argv[0]);
@@ -602,21 +672,61 @@ static void parse_args(int argc, char **argv, AppConfig *cfg) {
         }
     }
 
+    if (cfg->num_shards == 0 || cfg->num_shards > MAX_SHARDS) {
+        fprintf(stderr, "num-shards must be in [1, %d]\n", MAX_SHARDS);
+        exit(EXIT_FAILURE);
+    }
+
+    if (!cfg->disk_shards_set && cfg->num_shards != NUM_DISKS) {
+        fprintf(stderr,
+                "disk-shards is required when num-shards=%u differs from disk count=%d\n",
+                cfg->num_shards, NUM_DISKS);
+        exit(EXIT_FAILURE);
+    }
+
     if (!cfg->input_fvecs || !cfg->centroids_bin || !cfg->codebook_bin || !cfg->meta_out ||
         !cfg->disk_addrs[0] || !cfg->disk_addrs[1] || !cfg->disk_addrs[2] ||
-        !cfg->disk_addrs[3] || cfg->dim == 0 || cfg->shard_dims[0] == 0 ||
-        cfg->shard_dims[1] == 0 || cfg->shard_dims[2] == 0 || cfg->shard_dims[3] == 0) {
+        !cfg->disk_addrs[3] || cfg->dim == 0) {
         usage(argv[0]);
         exit(EXIT_FAILURE);
+    }
+
+    for (uint32_t s = 0; s < cfg->num_shards; s++) {
+        if (cfg->shard_dims[s] == 0) {
+            fprintf(stderr, "shard%u-dim must be > 0\n", s);
+            usage(argv[0]);
+            exit(EXIT_FAILURE);
+        }
+    }
+
+    bool shard_has_disk[MAX_SHARDS] = {false};
+    for (uint32_t d = 0; d < NUM_DISKS; d++) {
+        if (cfg->disk_shards[d] >= cfg->num_shards) {
+            fprintf(stderr,
+                    "disk-shards entry for disk%u is shard%u, but num-shards=%u\n",
+                    d, cfg->disk_shards[d], cfg->num_shards);
+            exit(EXIT_FAILURE);
+        }
+        shard_has_disk[cfg->disk_shards[d]] = true;
+    }
+    for (uint32_t s = 0; s < cfg->num_shards; s++) {
+        if (!shard_has_disk[s]) {
+            fprintf(stderr, "shard%u is not assigned to any disk\n", s);
+            exit(EXIT_FAILURE);
+        }
     }
 }
 
 int main(int argc, char **argv) {
     AppState app;
-    uint32_t shard_offsets[NUM_SHARDS];
-    uint32_t shard_bytes[NUM_SHARDS];
+    uint32_t shard_offsets[MAX_SHARDS];
+    uint32_t shard_bytes[MAX_SHARDS];
+    uint32_t shard_vectors_per_lba[MAX_SHARDS];
 
     memset(&app, 0, sizeof(app));
+    memset(shard_offsets, 0, sizeof(shard_offsets));
+    memset(shard_bytes, 0, sizeof(shard_bytes));
+    memset(shard_vectors_per_lba, 0, sizeof(shard_vectors_per_lba));
     parse_args(argc, argv, &app.cfg);
     compute_shard_layout(&app.cfg, shard_offsets, shard_bytes);
 
@@ -624,13 +734,25 @@ int main(int argc, char **argv) {
 
     {
         uint32_t sector_size = app.disks[0].sector_size;
-        uint32_t vectors_per_lba = compute_vectors_per_lba(sector_size, shard_bytes);
+        uint32_t vectors_per_lba =
+            compute_vectors_per_lba(sector_size,
+                                    shard_bytes,
+                                    app.cfg.num_shards,
+                                    shard_vectors_per_lba);
 
-        fprintf(stderr, "[info] dim=%u\n", app.cfg.dim);
-        for (int s = 0; s < NUM_SHARDS; s++) {
+        fprintf(stderr, "[info] dim=%u num_shards=%u\n", app.cfg.dim, app.cfg.num_shards);
+        for (uint32_t s = 0; s < app.cfg.num_shards; s++) {
             fprintf(stderr,
-                    "[info] disk%d dim=%u offset=%u shard_bytes=%u sector=%u\n",
-                    s, app.cfg.shard_dims[s], shard_offsets[s], shard_bytes[s], sector_size);
+                    "[info] shard%u dim=%u offset=%u shard_bytes=%u vectors_per_lba=%u sector=%u\n",
+                    s,
+                    app.cfg.shard_dims[s],
+                    shard_offsets[s],
+                    shard_bytes[s],
+                    shard_vectors_per_lba[s],
+                    sector_size);
+        }
+        for (uint32_t d = 0; d < NUM_DISKS; d++) {
+            fprintf(stderr, "[info] disk%u stores shard%u\n", d, app.cfg.disk_shards[d]);
         }
         fprintf(stderr, "[info] vectors_per_lba=%u\n", vectors_per_lba);
 
@@ -659,7 +781,7 @@ int main(int argc, char **argv) {
                     (uint32_t *)xmalloc((size_t)vecs.n * sizeof(uint32_t));
                 ClusterMetaEntry *cluster_meta =
                     (ClusterMetaEntry *)xcalloc(cents.nlist, sizeof(ClusterMetaEntry));
-                uint8_t *dma_buf[NUM_SHARDS] = {0};
+                uint8_t *dma_buf[MAX_SHARDS] = {0};
                 uint64_t cur_lba = app.cfg.base_lba;
 
                 for (uint32_t i = 0; i < vecs.n; i++) {
@@ -689,7 +811,14 @@ int main(int argc, char **argv) {
 
                 for (uint32_t c = 0; c < cents.nlist; c++) {
                     uint32_t sz = cluster_sizes[c];
-                    uint32_t num_lbas = (sz + vectors_per_lba - 1) / vectors_per_lba;
+                    uint32_t num_lbas = 0;
+                    for (uint32_t s = 0; s < app.cfg.num_shards; s++) {
+                        uint32_t shard_lbas =
+                            (sz + shard_vectors_per_lba[s] - 1) / shard_vectors_per_lba[s];
+                        if (shard_lbas > num_lbas) {
+                            num_lbas = shard_lbas;
+                        }
+                    }
 
                     cluster_meta[c].cluster_id = c;
                     cluster_meta[c].start_lba = cur_lba;
@@ -707,7 +836,7 @@ int main(int argc, char **argv) {
                     fprintf(stderr, "[info] saved sorted ids to %s\n", app.cfg.sorted_ids_out);
                 }
 
-                for (int s = 0; s < NUM_SHARDS; s++) {
+                for (uint32_t s = 0; s < app.cfg.num_shards; s++) {
                     dma_buf[s] = spdk_zmalloc(sector_size, sector_size, NULL,
                                               SPDK_ENV_LCORE_ID_ANY, SPDK_MALLOC_DMA);
                     if (!dma_buf[s]) {
@@ -722,54 +851,52 @@ int main(int argc, char **argv) {
                     uint64_t start_lba = cluster_meta[c].start_lba;
 
                     for (uint32_t b = 0; b < num_lbas; b++) {
-                        for (int s = 0; s < NUM_SHARDS; s++) {
+                        for (uint32_t s = 0; s < app.cfg.num_shards; s++) {
                             memset(dma_buf[s], 0, sector_size);
                         }
 
-                        for (uint32_t lane = 0; lane < vectors_per_lba; lane++) {
-                            uint32_t local_idx = b * vectors_per_lba + lane;
-                            if (local_idx >= num_vec) {
-                                break;
-                            }
+                        for (uint32_t s = 0; s < app.cfg.num_shards; s++) {
+                            for (uint32_t lane = 0; lane < shard_vectors_per_lba[s]; lane++) {
+                                uint32_t local_idx = b * shard_vectors_per_lba[s] + lane;
+                                if (local_idx >= num_vec) {
+                                    break;
+                                }
 
-                            {
                                 uint32_t vec_id = sorted_vec_ids[start_pos + local_idx];
                                 const float *vec = vecs.data + (size_t)vec_id * app.cfg.dim;
-
-                                for (int s = 0; s < NUM_SHARDS; s++) {
                                     const uint8_t *src =
                                         (const uint8_t *)(vec + shard_offsets[s]);
                                     uint8_t *dst = dma_buf[s] + (size_t)lane * shard_bytes[s];
                                     memcpy(dst, src, shard_bytes[s]);
-                                }
                             }
                         }
 
                         {
                             uint64_t lba = start_lba + b;
-                            IoCtx ctx[NUM_SHARDS];
+                            IoCtx ctx[NUM_DISKS];
 
                             memset(ctx, 0, sizeof(ctx));
-                            for (int s = 0; s < NUM_SHARDS; s++) {
-                                int rc = spdk_nvme_ns_cmd_write(app.disks[s].ns,
-                                                                app.disks[s].qpair,
-                                                                dma_buf[s],
+                            for (uint32_t d = 0; d < NUM_DISKS; d++) {
+                                uint32_t shard_id = app.cfg.disk_shards[d];
+                                int rc = spdk_nvme_ns_cmd_write(app.disks[d].ns,
+                                                                app.disks[d].qpair,
+                                                                dma_buf[shard_id],
                                                                 lba,
                                                                 1,
                                                                 io_complete,
-                                                                &ctx[s],
+                                                                &ctx[d],
                                                                 0);
                                 if (rc != 0) {
                                     fprintf(stderr,
-                                            "write submit failed: disk=%d lba=%" PRIu64
+                                            "write submit failed: disk=%u shard=%u lba=%" PRIu64
                                             " rc=%d\n",
-                                            s, lba, rc);
+                                            d, shard_id, lba, rc);
                                     exit(EXIT_FAILURE);
                                 }
                             }
 
-                            for (int s = 0; s < NUM_SHARDS; s++) {
-                                wait_io(app.disks[s].qpair, &ctx[s]);
+                            for (uint32_t d = 0; d < NUM_DISKS; d++) {
+                                wait_io(app.disks[d].qpair, &ctx[d]);
                             }
                         }
                     }
@@ -780,14 +907,14 @@ int main(int argc, char **argv) {
                     }
                 }
 
-                for (int s = 0; s < NUM_SHARDS; s++) {
+                for (uint32_t d = 0; d < NUM_DISKS; d++) {
                     IoCtx ctx = {0};
-                    int rc = spdk_nvme_ns_cmd_flush(app.disks[s].ns,
-                                                    app.disks[s].qpair,
+                    int rc = spdk_nvme_ns_cmd_flush(app.disks[d].ns,
+                                                    app.disks[d].qpair,
                                                     io_complete,
                                                     &ctx);
                     if (rc == 0) {
-                        wait_io(app.disks[s].qpair, &ctx);
+                        wait_io(app.disks[d].qpair, &ctx);
                     }
                 }
 
@@ -799,12 +926,13 @@ int main(int argc, char **argv) {
                                shard_offsets,
                                shard_bytes,
                                vectors_per_lba,
+                               shard_vectors_per_lba,
                                cluster_meta,
                                cents.centroids);
 
                 fprintf(stderr, "[done] metadata saved to %s\n", app.cfg.meta_out);
 
-                for (int s = 0; s < NUM_SHARDS; s++) {
+                for (uint32_t s = 0; s < app.cfg.num_shards; s++) {
                     spdk_free(dma_buf[s]);
                 }
 

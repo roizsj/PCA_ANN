@@ -97,7 +97,7 @@ query_tracker_t *register_query(pipeline_app_t *app,
             qt->topk_wall_us = 0;
             memset(&qt->query_topk, 0, sizeof(qt->query_topk));
 
-            for (int s = 0; s < NUM_STAGES; s++) {
+            for (uint32_t s = 0; s < app->active_stages; s++) {
                 uint32_t seg_dim = app->ivf_meta.header.shard_dims[s];
                 qt->query_segs[s] = (float *)calloc(seg_dim, sizeof(float));
                 if (!qt->query_segs[s]) {

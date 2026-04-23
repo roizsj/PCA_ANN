@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <getopt.h>
+#include <math.h>
 #include <time.h>
 #include <sched.h>
 #include <unistd.h>
@@ -25,6 +26,8 @@ typedef struct {
     uint32_t stage1_gap_merge_limit;
     uint32_t stage0_max_read_lbas;
     uint32_t active_stages;
+    uint32_t stage_disk_counts[NUM_STAGES];
+    float prune_proportion[NUM_STAGES];
     const char *coarse_backend;
     const char *prune_threshold_mode;
     const char *iova_mode;
@@ -70,10 +73,106 @@ static void init_runtime_options(runtime_options_t *opts)
     opts->stage1_gap_merge_limit = 1;
     opts->stage0_max_read_lbas = 0;
     opts->active_stages = NUM_STAGES;
+    for (int s = 0; s < NUM_STAGES; s++) {
+        opts->stage_disk_counts[s] = 1;
+        opts->prune_proportion[s] = 1.0f;
+    }
     opts->coarse_backend = "faiss";
     opts->prune_threshold_mode = "sampled";
     opts->iova_mode = NULL;
     opts->print_per_query = false;
+}
+
+static int parse_stage_disk_counts(const char *value, uint32_t counts[NUM_STAGES])
+{
+    if (!value || !counts) {
+        return -1;
+    }
+
+    char *copy = strdup(value);
+    if (!copy) {
+        perror("strdup stage-disk-counts");
+        return -1;
+    }
+
+    uint32_t idx = 0;
+    char *saveptr = NULL;
+    for (char *tok = strtok_r(copy, ",", &saveptr);
+         tok != NULL;
+         tok = strtok_r(NULL, ",", &saveptr)) {
+        if (idx >= NUM_STAGES) {
+            fprintf(stderr, "parse_runtime_options: too many stage-disk-counts entries, max=%d\n",
+                    NUM_STAGES);
+            free(copy);
+            return -1;
+        }
+        char *end = NULL;
+        unsigned long parsed = strtoul(tok, &end, 10);
+        if (!tok[0] || !end || *end != '\0' || parsed == 0 || parsed > MAX_DISKS_PER_STAGE) {
+            fprintf(stderr, "parse_runtime_options: invalid stage-disk-counts entry '%s'\n", tok);
+            free(copy);
+            return -1;
+        }
+        counts[idx++] = (uint32_t)parsed;
+    }
+
+    if (idx == 0) {
+        fprintf(stderr, "parse_runtime_options: stage-disk-counts must not be empty\n");
+        free(copy);
+        return -1;
+    }
+    for (; idx < NUM_STAGES; idx++) {
+        counts[idx] = 0;
+    }
+
+    free(copy);
+    return 0;
+}
+
+static int parse_prune_proportions(const char *value, float proportions[NUM_STAGES])
+{
+    if (!value || !proportions) {
+        return -1;
+    }
+
+    char *copy = strdup(value);
+    if (!copy) {
+        perror("strdup prune-proportions");
+        return -1;
+    }
+
+    uint32_t idx = 0;
+    char *saveptr = NULL;
+    for (char *tok = strtok_r(copy, ",", &saveptr);
+         tok != NULL;
+         tok = strtok_r(NULL, ",", &saveptr)) {
+        if (idx >= NUM_STAGES) {
+            fprintf(stderr, "parse_runtime_options: too many prune-proportions entries, max=%d\n",
+                    NUM_STAGES);
+            free(copy);
+            return -1;
+        }
+        char *end = NULL;
+        float parsed = strtof(tok, &end);
+        if (!tok[0] || !end || *end != '\0' || !isfinite(parsed) || parsed < 0.0f) {
+            fprintf(stderr, "parse_runtime_options: invalid prune-proportions entry '%s'\n", tok);
+            free(copy);
+            return -1;
+        }
+        proportions[idx++] = parsed;
+    }
+
+    if (idx == 0) {
+        fprintf(stderr, "parse_runtime_options: prune-proportions must not be empty\n");
+        free(copy);
+        return -1;
+    }
+    for (; idx < NUM_STAGES; idx++) {
+        proportions[idx] = 1.0f;
+    }
+
+    free(copy);
+    return 0;
 }
 
 static int parse_runtime_options(int argc, char **argv, runtime_options_t *opts)
@@ -92,6 +191,9 @@ static int parse_runtime_options(int argc, char **argv, runtime_options_t *opts)
         {"stage1-gap-merge", required_argument, 0, 'g'},
         {"stage0-max-read-lbas", required_argument, 0, 1001},
         {"active-stages", required_argument, 0, 'a'},
+        {"stage-disk-counts", required_argument, 0, 1002},
+        {"prune-proportions", required_argument, 0, 1003},
+        {"prune-proportion", required_argument, 0, 1003},
         {"coarse-backend", required_argument, 0, 'c'},
         {"prune-threshold-mode", required_argument, 0, 't'},
         {"iova-mode", required_argument, 0, 'i'},
@@ -125,6 +227,16 @@ static int parse_runtime_options(int argc, char **argv, runtime_options_t *opts)
             case 'a':
                 opts->active_stages = (uint32_t)strtoul(optarg, NULL, 10);
                 break;
+            case 1002:
+                if (parse_stage_disk_counts(optarg, opts->stage_disk_counts) != 0) {
+                    return -1;
+                }
+                break;
+            case 1003:
+                if (parse_prune_proportions(optarg, opts->prune_proportion) != 0) {
+                    return -1;
+                }
+                break;
             case 'c':
                 opts->coarse_backend = optarg;
                 break;
@@ -142,7 +254,7 @@ static int parse_runtime_options(int argc, char **argv, runtime_options_t *opts)
                 break;
             default:
                 fprintf(stderr,
-                        "Usage: %s [--max-queries N] [--nprobe N] [--read-depth N] [--stage0-gap-merge N] [--stage1-gap-merge N] [--stage0-max-read-lbas N] [--active-stages N] [--coarse-backend brute|faiss] [--prune-threshold-mode centroid|sampled] [--iova-mode pa|va] [--print-per-query] [--summary-only]\n",
+                        "Usage: %s [--max-queries N] [--nprobe N] [--read-depth N] [--stage0-gap-merge N] [--stage1-gap-merge N] [--stage0-max-read-lbas N] [--active-stages N] [--stage-disk-counts C0,C1,...] [--prune-proportions P0,P1,...] [--coarse-backend brute|faiss] [--prune-threshold-mode centroid|sampled] [--iova-mode pa|va] [--print-per-query] [--summary-only]\n",
                         argv[0]);
                 return -1;
         }
@@ -170,6 +282,31 @@ static int parse_runtime_options(int argc, char **argv, runtime_options_t *opts)
     }
     if (opts->active_stages == 0 || opts->active_stages > NUM_STAGES) {
         fprintf(stderr, "parse_runtime_options: active-stages must be in [1, %d]\n", NUM_STAGES);
+        return -1;
+    }
+    uint32_t total_stage_disks = 0;
+    for (uint32_t s = 0; s < opts->active_stages; s++) {
+        if (opts->stage_disk_counts[s] == 0 ||
+            opts->stage_disk_counts[s] > MAX_DISKS_PER_STAGE) {
+            fprintf(stderr,
+                    "parse_runtime_options: stage-disk-counts[%u] must be in [1, %d]\n",
+                    s,
+                    MAX_DISKS_PER_STAGE);
+            return -1;
+        }
+        total_stage_disks += opts->stage_disk_counts[s];
+        if (!isfinite(opts->prune_proportion[s]) || opts->prune_proportion[s] < 0.0f) {
+            fprintf(stderr,
+                    "parse_runtime_options: prune-proportions[%u] must be a finite value >= 0\n",
+                    s);
+            return -1;
+        }
+    }
+    if (total_stage_disks > NUM_STAGES) {
+        fprintf(stderr,
+                "parse_runtime_options: stage-disk-counts use %u disks but only %d are configured\n",
+                total_stage_disks,
+                NUM_STAGES);
         return -1;
     }
     if (strcmp(opts->coarse_backend, "brute") != 0 &&
@@ -680,7 +817,7 @@ int main(int argc, char **argv)
     /* 4. query 相关与输入参数配置 */
     float threshold = 1000000.0f; // fallback 阈值；正常情况下会被每个 query 的动态阈值覆盖
     const char *ivf_meta_path = 
-        "/home/zhangshujie/ann_ssd/pca_ann/preprocessing/gist1m_output/ivf_meta.bin"; // ivf_meta_flex 的路径
+        "/home/zhangshujie/ann_ssd/pca_ann/preprocessing/gist1m_output/ivf_meta_3stage.bin"; // ivf_meta_flex 的路径
     const char *query_fvecs_path =
         "/home/zhangshujie/ann_nic/gist/gist_query.fvecs";
     const char *gt_ivecs_path =
@@ -694,18 +831,21 @@ int main(int argc, char **argv)
     const char *pca_meta_path =
         "/home/zhangshujie/ann_ssd/pca_ann/preprocessing/gist1m_output/gist_pca_meta.bin";
     const char *sorted_ids_path =
-        "/home/zhangshujie/ann_ssd/pca_ann/preprocessing/gist1m_output/sorted_ids.bin";
+        "/home/zhangshujie/ann_ssd/pca_ann/preprocessing/gist1m_output/sorted_ids_3stage.bin";
 
     /* 5. 创建 pipeline 并启动 */
     pipeline_app_t app;
-    if (pipeline_init(&app, disks, stage_worker_counts, stage_cores, topk_core,
+    if (pipeline_init(&app, disks, stage_worker_counts,
+                      runtime_opts.stage_disk_counts,
+                      stage_cores, topk_core,
                       runtime_opts.read_depth,
                       runtime_opts.stage1_gap_merge_limit,
                       runtime_opts.stage0_gap_merge_limit,
                       runtime_opts.stage0_max_read_lbas,
                       runtime_opts.active_stages,
                       runtime_opts.coarse_backend, runtime_opts.prune_threshold_mode,
-                      threshold, ivf_meta_path, sorted_ids_path) != 0) {
+                      threshold, runtime_opts.prune_proportion,
+                      ivf_meta_path, sorted_ids_path) != 0) {
         fprintf(stderr, "pipeline_init failed\n");
         return 1;
     }

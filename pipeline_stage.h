@@ -35,8 +35,11 @@ typedef enum {
  * 全局常量
  * ----------------------------- */
 
-/* 4-stage pipeline */
+/* Maximum supported pipeline stages / physical disks. Runtime can use fewer stages. */
 #define NUM_STAGES 4
+
+/* A stage can stripe identical shard data over up to all physical disks. */
+#define MAX_DISKS_PER_STAGE NUM_STAGES
 
 /* 每个 stage 最多绑定多少个 worker / CPU 核 */
 #define MAX_WORKERS_PER_STAGE 12
@@ -84,6 +87,7 @@ typedef struct {
     uint32_t num_vectors;      // 总向量数
     uint32_t sector_size;      // 扇区大小
     uint64_t base_lba;         // 基础LBA
+    uint32_t shard_vectors_per_lba[NUM_STAGES]; // 每个 shard/stage 各自的 LBA packing
 } ivf_meta_header_t;
 
 // 声明结构体，用于存储聚类信息
@@ -241,6 +245,7 @@ typedef struct {
     int core_id;        /* 绑到哪个 CPU 核 */
 
     disk_ctx_t *disk;   /* 这个 worker 对应哪块盘 */
+    int disk_id;        /* app->disks[] 下标，方便调试 */
     struct spdk_nvme_qpair *qpair;
 
     pthread_t tid;
@@ -340,12 +345,17 @@ typedef struct pipeline_app {
     stage_worker_t workers[NUM_STAGES][MAX_WORKERS_PER_STAGE];
     uint32_t stage_worker_counts[NUM_STAGES];
     uint32_t stage_rr_cursor[NUM_STAGES];
+    uint32_t stage_disk_counts[NUM_STAGES];
+    uint32_t stage_disk_indices[NUM_STAGES][MAX_DISKS_PER_STAGE];
 
     /* top-k 线程 */
     topk_worker_t topk;
 
     /* 提前终止阈值 */
     float threshold;
+
+    /* 每个 stage 对原始 prune 阈值的缩放比例 */
+    float prune_proportion[NUM_STAGES];
 
     /* 每个 stage worker 允许挂起的读请求深度 */
     uint32_t read_depth;
@@ -457,12 +467,14 @@ const cluster_info_t *find_cluster_info(const ivf_meta_t *meta, uint32_t cluster
  *  - stage0_max_read_lbas: stage0 单次读最多合并多少个 LBA
  *  - coarse_backend_name: coarse search 后端，brute 或 faiss
  *  - threshold: 提前终止阈值
+ *  - prune_proportion: 每个 stage 的 prune 阈值缩放比例
  *  - ivf_meta_path: ivf_meta_flex.bin 的路径
  */
 int pipeline_init(
     pipeline_app_t *app,
     disk_ctx_t disks[NUM_STAGES],
     const uint32_t stage_worker_counts[NUM_STAGES],
+    const uint32_t stage_disk_counts[NUM_STAGES],
     const int stage_cores[NUM_STAGES][MAX_WORKERS_PER_STAGE],
     int topk_core,
     uint32_t read_depth,
@@ -473,6 +485,7 @@ int pipeline_init(
     const char *coarse_backend_name,
     const char *prune_threshold_mode_name,
     float threshold,
+    const float prune_proportion[NUM_STAGES],
     const char *ivf_meta_path,
     const char *sorted_ids_path
 );

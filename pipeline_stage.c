@@ -59,6 +59,15 @@ struct worker_batch_stats {
 
 static __thread uint32_t tls_vectors_per_lba_for_sort = 1;
 
+static uint32_t stage_vectors_per_lba(const pipeline_app_t *app, uint32_t stage_id)
+{
+    if (!app || stage_id >= NUM_STAGES) {
+        return 1;
+    }
+    uint32_t v = app->ivf_meta.header.shard_vectors_per_lba[stage_id];
+    return v ? v : app->ivf_meta.header.vectors_per_lba;
+}
+
 static inline uint64_t now_us(void)
 {
     struct timespec ts;
@@ -150,12 +159,11 @@ static int build_prune_sample_vectors(pipeline_app_t *app)
     const uint32_t total = app->ivf_meta.header.num_vectors;
     const uint32_t dim = app->ivf_meta.header.dim;
     const uint32_t sample_count = total < PRUNE_SAMPLE_SIZE ? total : PRUNE_SAMPLE_SIZE;
-    const uint32_t vectors_per_lba = app->ivf_meta.header.vectors_per_lba;
     struct spdk_nvme_qpair *qpairs[NUM_STAGES] = {0};
     void *sector_bufs[NUM_STAGES] = {0};
     int rc = -1;
 
-    if (sample_count == 0 || dim == 0 || vectors_per_lba == 0) {
+    if (sample_count == 0 || dim == 0 || app->ivf_meta.header.vectors_per_lba == 0) {
         return -1;
     }
 
@@ -167,20 +175,21 @@ static int build_prune_sample_vectors(pipeline_app_t *app)
     }
     app->prune_sample_count = sample_count;
 
-    for (int s = 0; s < NUM_STAGES; s++) {
-        qpairs[s] = spdk_nvme_ctrlr_alloc_io_qpair(app->disks[s].ctrlr, NULL, 0);
+    for (uint32_t s = 0; s < app->active_stages; s++) {
+        uint32_t disk_idx = app->stage_disk_indices[s][0];
+        qpairs[s] = spdk_nvme_ctrlr_alloc_io_qpair(app->disks[disk_idx].ctrlr, NULL, 0);
         if (!qpairs[s]) {
-            fprintf(stderr, "build_prune_sample_vectors: alloc_io_qpair failed stage=%d disk=%s\n",
-                    s, app->disks[s].traddr);
+            fprintf(stderr, "build_prune_sample_vectors: alloc_io_qpair failed stage=%u disk=%s\n",
+                    s, app->disks[disk_idx].traddr);
             goto cleanup;
         }
-        sector_bufs[s] = spdk_zmalloc(app->disks[s].sector_size,
-                                      app->disks[s].sector_size,
+        sector_bufs[s] = spdk_zmalloc(app->disks[disk_idx].sector_size,
+                                      app->disks[disk_idx].sector_size,
                                       NULL,
                                       SPDK_ENV_NUMA_ID_ANY,
                                       SPDK_MALLOC_DMA);
         if (!sector_bufs[s]) {
-            fprintf(stderr, "build_prune_sample_vectors: spdk_zmalloc failed stage=%d\n", s);
+            fprintf(stderr, "build_prune_sample_vectors: spdk_zmalloc failed stage=%u\n", s);
             goto cleanup;
         }
     }
@@ -205,16 +214,18 @@ static int build_prune_sample_vectors(pipeline_app_t *app)
             }
 
             uint32_t local_idx = (uint32_t)(sorted_pos - (uint64_t)ci->sorted_id_base);
-            uint32_t bundle_idx = local_idx / vectors_per_lba;
-            uint32_t lane_idx = local_idx % vectors_per_lba;
             float *dst = app->prune_sample_vectors + (size_t)i * (size_t)dim;
 
-            for (int s = 0; s < NUM_STAGES; s++) {
+            for (uint32_t s = 0; s < app->active_stages; s++) {
+                uint32_t disk_idx = app->stage_disk_indices[s][0];
+                uint32_t vectors_per_lba = stage_vectors_per_lba(app, s);
+                uint32_t bundle_idx = local_idx / vectors_per_lba;
+                uint32_t lane_idx = local_idx % vectors_per_lba;
                 uint64_t lba = ci->start_lba + bundle_idx;
-                if (read_lba_sync(app->disks[s].ns, qpairs[s], sector_bufs[s], lba, 1) != 0) {
+                if (read_lba_sync(app->disks[disk_idx].ns, qpairs[s], sector_bufs[s], lba, 1) != 0) {
                     fprintf(stderr,
-                            "build_prune_sample_vectors: read failed stage=%d cluster=%u lba=%" PRIu64 "\n",
-                            s, ci->cluster_id, lba);
+                            "build_prune_sample_vectors: read failed stage=%u disk=%u cluster=%u lba=%" PRIu64 "\n",
+                            s, disk_idx, ci->cluster_id, lba);
                     goto cleanup;
                 }
 
@@ -228,7 +239,7 @@ static int build_prune_sample_vectors(pipeline_app_t *app)
     rc = 0;
 
 cleanup:
-    for (int s = 0; s < NUM_STAGES; s++) {
+    for (uint32_t s = 0; s < app->active_stages; s++) {
         if (sector_bufs[s]) {
             spdk_free(sector_bufs[s]);
         }
@@ -777,6 +788,8 @@ static int stage_worker_load_query_ctx(stage_worker_t *w,
     }
     pthread_mutex_unlock(&app->query_mu);
 
+    ctx->prune_threshold *= app->prune_proportion[w->stage_id];
+
     if (!ctx->query_seg) {
         fprintf(stderr,
                 "[stage %d lane %d] query seg not found for qid=%lu\n",
@@ -789,7 +802,7 @@ static int stage_worker_load_query_ctx(stage_worker_t *w,
     return 0;
 }
 
-static void stage_worker_sort_batch(pipeline_app_t *app,
+static void stage_worker_sort_batch(stage_worker_t *w,
                                     batch_t *in,
                                     struct worker_batch_stats *stats)
 {
@@ -798,7 +811,7 @@ static void stage_worker_sort_batch(pipeline_app_t *app,
     }
 
     uint64_t qsort_begin_us = now_us();
-    tls_vectors_per_lba_for_sort = app->ivf_meta.header.vectors_per_lba;
+    tls_vectors_per_lba_for_sort = stage_vectors_per_lba(w->app, (uint32_t)w->stage_id);
     qsort(in->items, in->count, sizeof(in->items[0]), cmp_cand_item_by_bundle);
     stats->batch_qsort_us += now_us() - qsort_begin_us;
 }
@@ -815,7 +828,7 @@ static void stage_worker_finish_run(stage_worker_t *w,
                                     struct bundle_run *run)
 {
     pipeline_app_t *app = w->app;
-    const uint32_t vectors_per_lba = app->ivf_meta.header.vectors_per_lba;
+    const uint32_t vectors_per_lba = stage_vectors_per_lba(app, (uint32_t)w->stage_id);
     const uint32_t stage_dim = app->ivf_meta.header.shard_dims[w->stage_id];
     const uint32_t shard_bytes = app->ivf_meta.header.shard_bytes[w->stage_id];
     uint64_t run_io_us = run->complete_us > run->submit_us
@@ -901,10 +914,10 @@ static void stage_worker_process_batch(stage_worker_t *w,
         return;
     }
 
-    stage_worker_sort_batch(app, in, &stats);
+    stage_worker_sort_batch(w, in, &stats);
 
     if (in->count > 0) {
-        const uint32_t vectors_per_lba = app->ivf_meta.header.vectors_per_lba;
+        const uint32_t vectors_per_lba = stage_vectors_per_lba(app, (uint32_t)w->stage_id);
         const uint32_t max_gap_bundles = (w->stage_id == 0)
                                              ? app->stage0_gap_merge_limit
                                              : app->stage1_gap_merge_limit;
@@ -1134,6 +1147,8 @@ static int pipeline_validate_init_args(uint32_t read_depth,
                                        uint32_t stage0_gap_merge_limit,
                                        uint32_t stage0_max_read_lbas,
                                        uint32_t active_stages,
+                                       const uint32_t stage_disk_counts[NUM_STAGES],
+                                       const float prune_proportion[NUM_STAGES],
                                        coarse_backend_t backend,
                                        prune_threshold_mode_t prune_mode,
                                        const char *coarse_backend_name_arg,
@@ -1150,6 +1165,40 @@ static int pipeline_validate_init_args(uint32_t read_depth,
         fprintf(stderr,
                 "pipeline_init: invalid active stages=%u valid_range=[1,%d]\n",
                 active_stages,
+                NUM_STAGES);
+        return -1;
+    }
+    if (!stage_disk_counts) {
+        fprintf(stderr, "pipeline_init: stage_disk_counts is required\n");
+        return -1;
+    }
+    if (!prune_proportion) {
+        fprintf(stderr, "pipeline_init: prune_proportion is required\n");
+        return -1;
+    }
+    uint32_t total_disks = 0;
+    for (uint32_t s = 0; s < active_stages; s++) {
+        if (stage_disk_counts[s] == 0 || stage_disk_counts[s] > MAX_DISKS_PER_STAGE) {
+            fprintf(stderr,
+                    "pipeline_init: invalid disk count stage=%u count=%u valid_range=[1,%d]\n",
+                    s,
+                    stage_disk_counts[s],
+                    MAX_DISKS_PER_STAGE);
+            return -1;
+        }
+        total_disks += stage_disk_counts[s];
+        if (!isfinite(prune_proportion[s]) || prune_proportion[s] < 0.0f) {
+            fprintf(stderr,
+                    "pipeline_init: invalid prune_proportion[%u]=%f, expected finite value >= 0\n",
+                    s,
+                    prune_proportion[s]);
+            return -1;
+        }
+    }
+    if (total_disks > NUM_STAGES) {
+        fprintf(stderr,
+                "pipeline_init: stage disk counts use %u disks but only %d are configured\n",
+                total_disks,
                 NUM_STAGES);
         return -1;
     }
@@ -1184,6 +1233,22 @@ static int pipeline_validate_init_args(uint32_t read_depth,
     return 0;
 }
 
+static void pipeline_assign_stage_disk_config(pipeline_app_t *app,
+                                              const uint32_t stage_disk_counts[NUM_STAGES])
+{
+    uint32_t next_disk = 0;
+
+    memset(app->stage_disk_counts, 0, sizeof(app->stage_disk_counts));
+    memset(app->stage_disk_indices, 0, sizeof(app->stage_disk_indices));
+
+    for (uint32_t s = 0; s < app->active_stages; s++) {
+        app->stage_disk_counts[s] = stage_disk_counts[s];
+        for (uint32_t i = 0; i < stage_disk_counts[s]; i++) {
+            app->stage_disk_indices[s][i] = next_disk++;
+        }
+    }
+}
+
 static int pipeline_copy_disk_ctxs(pipeline_app_t *app, disk_ctx_t disks[NUM_STAGES])
 {
     for (int i = 0; i < NUM_STAGES; i++) {
@@ -1206,7 +1271,8 @@ static void pipeline_assign_runtime_config(pipeline_app_t *app,
                                            uint32_t stage0_max_read_lbas,
                                            uint32_t active_stages,
                                            coarse_backend_t backend,
-                                           prune_threshold_mode_t prune_mode)
+                                           prune_threshold_mode_t prune_mode,
+                                           const float prune_proportion[NUM_STAGES])
 {
     app->threshold = threshold;
     app->read_depth = read_depth;
@@ -1216,25 +1282,49 @@ static void pipeline_assign_runtime_config(pipeline_app_t *app,
     app->active_stages = active_stages;
     app->coarse_backend = backend;
     app->prune_threshold_mode = prune_mode;
+    for (uint32_t s = 0; s < NUM_STAGES; s++) {
+        app->prune_proportion[s] = prune_proportion ? prune_proportion[s] : 1.0f;
+    }
 }
 
 static int pipeline_check_meta_compatibility(pipeline_app_t *app)
 {
-    for (int s = 0; s < NUM_STAGES; s++) {
-        if (app->disks[s].sector_size != app->ivf_meta.header.sector_size) {
-            fprintf(stderr,
-                    "pipeline_init: sector size mismatch stage=%d disk=%u meta=%u\n",
-                    s,
-                    app->disks[s].sector_size,
-                    app->ivf_meta.header.sector_size);
-            return -1;
+    if (app->ivf_meta.header.num_shards != app->active_stages) {
+        fprintf(stderr,
+                "pipeline_init: metadata num_shards=%u does not match active_stages=%u\n",
+                app->ivf_meta.header.num_shards,
+                app->active_stages);
+        return -1;
+    }
+
+    for (uint32_t s = 0; s < app->active_stages; s++) {
+        for (uint32_t i = 0; i < app->stage_disk_counts[s]; i++) {
+            uint32_t disk_idx = app->stage_disk_indices[s][i];
+            if (disk_idx >= NUM_STAGES) {
+                fprintf(stderr,
+                        "pipeline_init: invalid disk index stage=%u disk_slot=%u disk_idx=%u\n",
+                        s,
+                        i,
+                        disk_idx);
+                return -1;
+            }
+            if (app->disks[disk_idx].sector_size != app->ivf_meta.header.sector_size) {
+                fprintf(stderr,
+                        "pipeline_init: sector size mismatch stage=%u disk=%u disk_sector=%u meta=%u\n",
+                        s,
+                        disk_idx,
+                        app->disks[disk_idx].sector_size,
+                        app->ivf_meta.header.sector_size);
+                return -1;
+            }
         }
-        if (app->ivf_meta.header.shard_bytes[s] > app->disks[s].sector_size) {
+
+        if (app->ivf_meta.header.shard_bytes[s] > app->ivf_meta.header.sector_size) {
             fprintf(stderr,
                     "pipeline_init: shard bytes exceed sector size stage=%d shard_bytes=%u sector=%u\n",
                     s,
                     app->ivf_meta.header.shard_bytes[s],
-                    app->disks[s].sector_size);
+                    app->ivf_meta.header.sector_size);
             return -1;
         }
     }
@@ -1277,12 +1367,16 @@ static int pipeline_init_workers(pipeline_app_t *app,
     app->topk.core_id = topk_core;
 
     int worker_id = 0;
-    for (int s = 0; s < NUM_STAGES; s++) {
+    for (uint32_t s = 0; s < app->active_stages; s++) {
         uint32_t worker_count = stage_worker_counts[s];
         if (worker_count == 0 || worker_count > MAX_WORKERS_PER_STAGE) {
             fprintf(stderr,
-                    "pipeline_init: invalid worker count stage=%d count=%u max=%d\n",
+                    "pipeline_init: invalid worker count stage=%u count=%u max=%d\n",
                     s, worker_count, MAX_WORKERS_PER_STAGE);
+            return -1;
+        }
+        if (app->stage_disk_counts[s] == 0) {
+            fprintf(stderr, "pipeline_init: stage=%u has no disks\n", s);
             return -1;
         }
 
@@ -1290,13 +1384,16 @@ static int pipeline_init_workers(pipeline_app_t *app,
         app->stage_rr_cursor[s] = 0;
 
         for (uint32_t lane = 0; lane < worker_count; lane++) {
+            uint32_t disk_slot = lane % app->stage_disk_counts[s];
+            uint32_t disk_idx = app->stage_disk_indices[s][disk_slot];
             stage_worker_t *w = &app->workers[s][lane];
             w->app = app;
             w->worker_id = worker_id++;
             w->stage_id = s;
             w->lane_id = (int)lane;
             w->core_id = stage_cores[s][lane];
-            w->disk = &app->disks[s];
+            w->disk_id = (int)disk_idx;
+            w->disk = &app->disks[disk_idx];
             w->qpair = NULL;
             queue_init(&w->inq);
         }
@@ -1322,6 +1419,7 @@ int pipeline_init(
     pipeline_app_t *app,
     disk_ctx_t disks[NUM_STAGES],
     const uint32_t stage_worker_counts[NUM_STAGES],
+    const uint32_t stage_disk_counts[NUM_STAGES],
     const int stage_cores[NUM_STAGES][MAX_WORKERS_PER_STAGE],
     int topk_core,
     uint32_t read_depth,
@@ -1332,6 +1430,7 @@ int pipeline_init(
     const char *coarse_backend_name_arg,
     const char *prune_threshold_mode_name_arg,
     float threshold,
+    const float prune_proportion[NUM_STAGES],
     const char *ivf_meta_path,
     const char *sorted_ids_path
 )
@@ -1347,6 +1446,8 @@ int pipeline_init(
                                     stage0_gap_merge_limit,
                                     stage0_max_read_lbas,
                                     active_stages,
+                                    stage_disk_counts,
+                                    prune_proportion,
                                     backend,
                                     prune_mode,
                                     coarse_backend_name_arg,
@@ -1378,7 +1479,15 @@ int pipeline_init(
                                    stage0_max_read_lbas,
                                    active_stages,
                                    backend,
-                                   prune_mode);
+                                   prune_mode,
+                                   prune_proportion);
+    pipeline_assign_stage_disk_config(app, stage_disk_counts);
+
+    fprintf(stderr, "[pipeline_init] prune_proportion:");
+    for (uint32_t s = 0; s < active_stages; s++) {
+        fprintf(stderr, " stage%u=%.6f", s, app->prune_proportion[s]);
+    }
+    fprintf(stderr, "\n");
 
     fprintf(stderr, "[pipeline_init] before parse_ivf_meta\n");
     if (parse_ivf_meta(ivf_meta_path, &app->ivf_meta) != 0) {
@@ -1390,12 +1499,22 @@ int pipeline_init(
     app->centroids = app->ivf_meta.centroids;
 
     fprintf(stderr,
-            "[pipeline_init] after parse_ivf_meta dim=%u nlist=%u num_vectors=%u sector_size=%u backend=%s\n",
+            "[pipeline_init] after parse_ivf_meta version=%u dim=%u nlist=%u num_vectors=%u sector_size=%u backend=%s\n",
+            app->ivf_meta.header.version,
             app->ivf_meta.header.dim,
             app->ivf_meta.nlist,
             app->ivf_meta.header.num_vectors,
             app->ivf_meta.header.sector_size,
             coarse_backend_name(app->coarse_backend));
+    for (uint32_t s = 0; s < app->ivf_meta.header.num_shards; s++) {
+        fprintf(stderr,
+                "[pipeline_init] shard%u dim=%u bytes=%u vectors_per_lba=%u offset=%u\n",
+                s,
+                app->ivf_meta.header.shard_dims[s],
+                app->ivf_meta.header.shard_bytes[s],
+                stage_vectors_per_lba(app, s),
+                app->ivf_meta.header.shard_offsets[s]);
+    }
 
     if (app->coarse_backend == COARSE_BACKEND_FAISS) {
         fprintf(stderr, "[pipeline_init] before coarse_search_module_init\n");
@@ -1631,7 +1750,6 @@ int submit_cluster_candidates(pipeline_app_t *app,
 
     uint32_t num_vec = ci->num_vectors;
     uint32_t local_idx = 0;
-    uint32_t batches_submitted = 0;
     uint32_t sorted_base = ci->sorted_id_base;
 
     if (!app->sorted_vec_ids || sorted_base + num_vec > app->num_sorted_vec_ids) {
@@ -1640,6 +1758,16 @@ int submit_cluster_candidates(pipeline_app_t *app,
                 cluster_id, sorted_base, num_vec, app->num_sorted_vec_ids);
         return -1;
     }
+
+    pthread_mutex_lock(&app->query_mu);
+    query_tracker_t *qt_for_submit = pipeline_find_query_tracker_locked(app, qid);
+    if (!qt_for_submit) {
+        pthread_mutex_unlock(&app->query_mu);
+        fprintf(stderr, "submit_cluster_candidates: qid=%lu not registered\n", qid);
+        return -1;
+    }
+    qt_for_submit->initial_candidates += num_vec;
+    pthread_mutex_unlock(&app->query_mu);
 
     while (local_idx < num_vec) {
         batch_t *b = (batch_t *)calloc(1, sizeof(*b));
@@ -1666,28 +1794,25 @@ int submit_cluster_candidates(pipeline_app_t *app,
             break;
         }
 
-        pipeline_submit_initial_batch(app, b);
-        batches_submitted++;
-    }
-
-    pthread_mutex_lock(&app->query_mu);
-    for (uint32_t i = 0; i < MAX_QUERIES_IN_FLIGHT; i++) {
-        query_tracker_t *qt = &app->queries[i];
-        if (qt->qid == qid) {
-            qt->initial_candidates += num_vec;
-            qt->submitted_batches += batches_submitted;
-            qt->outstanding_batches += batches_submitted;
-            if (qt->outstanding_batches > qt->max_outstanding_batches) {
-                qt->max_outstanding_batches = qt->outstanding_batches;
-            }
+        pthread_mutex_lock(&app->query_mu);
+        qt_for_submit = pipeline_find_query_tracker_locked(app, qid);
+        if (!qt_for_submit) {
             pthread_mutex_unlock(&app->query_mu);
-            return 0;
+            fprintf(stderr, "submit_cluster_candidates: qid=%lu not registered\n", qid);
+            free(b);
+            return -1;
         }
-    }
-    pthread_mutex_unlock(&app->query_mu);
+        qt_for_submit->submitted_batches++;
+        qt_for_submit->outstanding_batches++;
+        if (qt_for_submit->outstanding_batches > qt_for_submit->max_outstanding_batches) {
+            qt_for_submit->max_outstanding_batches = qt_for_submit->outstanding_batches;
+        }
+        pthread_mutex_unlock(&app->query_mu);
 
-    fprintf(stderr, "submit_cluster_candidates: qid=%lu not registered\n", qid);
-    return -1;
+        pipeline_submit_initial_batch(app, b);
+    }
+
+    return 0;
 }
 
 
@@ -1725,7 +1850,7 @@ int submit_query(pipeline_app_t *app,
     }
 
     /* 2) 切 query segments */
-    for (int s = 0; s < NUM_STAGES; s++) {
+    for (uint32_t s = 0; s < app->active_stages; s++) {
         uint32_t seg_dim = app->ivf_meta.header.shard_dims[s];
         uint32_t seg_offset = app->ivf_meta.header.shard_offsets[s];
         memcpy(qt->query_segs[s],

@@ -4,6 +4,21 @@
 #include <stdlib.h>
 #include <string.h>
 
+typedef struct {
+    uint32_t magic;
+    uint32_t version;
+    uint32_t dim;
+    uint32_t num_shards;
+    uint32_t shard_dims[NUM_STAGES];
+    uint32_t shard_offsets[NUM_STAGES];
+    uint32_t shard_bytes[NUM_STAGES];
+    uint32_t vectors_per_lba;
+    uint32_t nlist;
+    uint32_t num_vectors;
+    uint32_t sector_size;
+    uint64_t base_lba;
+} ivf_meta_header_v1_t;
+
 int parse_ivf_meta(const char *filename, ivf_meta_t *meta)
 {
     if (!meta) {
@@ -17,12 +32,27 @@ int parse_ivf_meta(const char *filename, ivf_meta_t *meta)
         return -1;
     }
 
-    ivf_meta_header_t header;
-    if (fread(&header, sizeof(header), 1, fp) != 1) {
+    ivf_meta_header_v1_t disk_header;
+    if (fread(&disk_header, sizeof(disk_header), 1, fp) != 1) {
         fprintf(stderr, "Failed to read MetaHeader\n");
         fclose(fp);
         return -1;
     }
+
+    ivf_meta_header_t header;
+    memset(&header, 0, sizeof(header));
+    header.magic = disk_header.magic;
+    header.version = disk_header.version;
+    header.dim = disk_header.dim;
+    header.num_shards = disk_header.num_shards;
+    memcpy(header.shard_dims, disk_header.shard_dims, sizeof(header.shard_dims));
+    memcpy(header.shard_offsets, disk_header.shard_offsets, sizeof(header.shard_offsets));
+    memcpy(header.shard_bytes, disk_header.shard_bytes, sizeof(header.shard_bytes));
+    header.vectors_per_lba = disk_header.vectors_per_lba;
+    header.nlist = disk_header.nlist;
+    header.num_vectors = disk_header.num_vectors;
+    header.sector_size = disk_header.sector_size;
+    header.base_lba = disk_header.base_lba;
 
     if (header.magic != IVF_META_MAGIC_FLEX) {
         fprintf(stderr, "Invalid magic number: 0x%08X\n", header.magic);
@@ -30,14 +60,29 @@ int parse_ivf_meta(const char *filename, ivf_meta_t *meta)
         return -1;
     }
 
-    if (header.version != 1) {
+    if (header.version != 1 && header.version != 2) {
         fprintf(stderr, "Unsupported IVF meta version: %u\n", header.version);
         fclose(fp);
         return -1;
     }
 
-    if (header.num_shards != NUM_STAGES) {
-        fprintf(stderr, "Unsupported num_shards: %u expected=%d\n",
+    if (header.version >= 2) {
+        if (fread(header.shard_vectors_per_lba,
+                  sizeof(header.shard_vectors_per_lba[0]),
+                  NUM_STAGES,
+                  fp) != NUM_STAGES) {
+            fprintf(stderr, "Failed to read per-shard vectors_per_lba\n");
+            fclose(fp);
+            return -1;
+        }
+    } else {
+        for (uint32_t s = 0; s < NUM_STAGES; s++) {
+            header.shard_vectors_per_lba[s] = header.vectors_per_lba;
+        }
+    }
+
+    if (header.num_shards == 0 || header.num_shards > NUM_STAGES) {
+        fprintf(stderr, "Unsupported num_shards: %u valid_range=[1,%d]\n",
                 header.num_shards, NUM_STAGES);
         fclose(fp);
         return -1;
@@ -49,6 +94,13 @@ int parse_ivf_meta(const char *filename, ivf_meta_t *meta)
                 header.dim, header.nlist, header.vectors_per_lba);
         fclose(fp);
         return -1;
+    }
+    for (uint32_t s = 0; s < header.num_shards; s++) {
+        if (header.shard_vectors_per_lba[s] == 0) {
+            fprintf(stderr, "Invalid shard_vectors_per_lba[%u]=0\n", s);
+            fclose(fp);
+            return -1;
+        }
     }
 
     meta->header = header;

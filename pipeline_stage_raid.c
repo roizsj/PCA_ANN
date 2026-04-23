@@ -1337,18 +1337,27 @@ int pipeline_init(
     pipeline_app_t *app,
     disk_ctx_t disks[NUM_STAGES],
     const uint32_t stage_worker_counts[NUM_STAGES],
+    const uint32_t stage_disk_counts[NUM_STAGES],
     const int stage_cores[NUM_STAGES][MAX_WORKERS_PER_STAGE],
     int topk_core,
     uint32_t read_depth,
     uint32_t stage1_gap_merge_limit,
+    uint32_t stage0_gap_merge_limit,
+    uint32_t stage0_max_read_lbas,
     uint32_t active_stages,
     const char *coarse_backend_name_arg,
     const char *prune_threshold_mode_name_arg,
     float threshold,
+    const float prune_proportion[NUM_STAGES],
     const char *ivf_meta_path,
     const char *sorted_ids_path
 )
 {
+    (void)stage_disk_counts;
+    (void)stage0_gap_merge_limit;
+    (void)stage0_max_read_lbas;
+    (void)prune_proportion;
+
     coarse_backend_t backend = parse_coarse_backend_name(coarse_backend_name_arg);
     prune_threshold_mode_t prune_mode = parse_prune_threshold_mode_name(prune_threshold_mode_name_arg);
 

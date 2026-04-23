@@ -660,6 +660,8 @@ int main(int argc, char **argv)
     /* 3. core 配置 */
     // TODO 如果后面要改每个stage的核数，就改这一行
     const uint32_t stage_worker_counts[NUM_STAGES] = {8, 4, 4, 4};
+    const uint32_t stage_disk_counts[NUM_STAGES] = {1, 1, 1, 1};
+    const float prune_proportion[NUM_STAGES] = {1.0f, 1.0f, 1.0f, 1.0f};
     const int stage_cores[NUM_STAGES][MAX_WORKERS_PER_STAGE] = {
         {1, 5, 9, 13, 17, 19, 21, 23},
         {2, 6, 10, 14, 18, 20, 22, 24},
@@ -689,11 +691,14 @@ int main(int argc, char **argv)
 
     /* 5. 创建 pipeline 并启动 */
     pipeline_app_t app;
-    if (pipeline_init(&app, disks, stage_worker_counts, stage_cores, topk_core,
+    if (pipeline_init(&app, disks, stage_worker_counts, stage_disk_counts,
+                      stage_cores, topk_core,
                       runtime_opts.read_depth, runtime_opts.stage1_gap_merge_limit,
+                      0, 0,
                       runtime_opts.active_stages,
                       runtime_opts.coarse_backend, runtime_opts.prune_threshold_mode,
-                      threshold, ivf_meta_path, sorted_ids_path) != 0) {
+                      threshold, prune_proportion,
+                      ivf_meta_path, sorted_ids_path) != 0) {
         fprintf(stderr, "pipeline_init failed\n");
         return 1;
     }
